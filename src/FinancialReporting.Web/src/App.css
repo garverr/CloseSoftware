@@ -713,6 +713,7 @@ h2 {
 .flux-toolbar input,
 .flux-toolbar select,
 .flux-settings-panel input,
+.flux-settings-panel select,
 .flux-settings-panel textarea {
   width: 100%;
   border: 1px solid var(--border);
@@ -724,7 +725,8 @@ h2 {
 
 .flux-toolbar input,
 .flux-toolbar select,
-.flux-settings-panel input {
+.flux-settings-panel input,
+.flux-settings-panel select {
   min-height: 38px;
   padding: 0 10px;
 }
