@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { API_BASE, fetchJson, postJson } from './api/client'
-import { Button, RailItem, SegmentButton } from './components/primitives'
+import { Button } from './components/primitives'
+import { CommandPalette } from './components/CommandPalette'
 import { FluxReviewPanel } from './features/flux/FluxReviewPanel'
 import { AccountPanel, MappingView } from './features/mapping/MappingView'
 import { SlideEditor } from './features/packages/SlideEditor'
@@ -8,7 +9,9 @@ import { BenchmarkingView } from './pages/BenchmarkingPage'
 import { BrandingView } from './pages/BrandingPage'
 import { CompetitiveParityView } from './pages/CompetitiveParityPage'
 import { Dashboard } from './pages/DashboardPage'
+import { EliminationsView } from './pages/EliminationsPage'
 import { ExecutiveLibrary } from './pages/ExecutiveLibraryPage'
+import { FsLibraryView } from './pages/FsLibraryPage'
 import { KpiLibrary } from './pages/KpisPage'
 import { LayoutsView } from './pages/LayoutsPage'
 import { LiveDashboard } from './pages/LiveDashboardPage'
@@ -20,25 +23,20 @@ import { StatementsView } from './pages/StatementsPage'
 import { XeroSettings } from './pages/XeroSettingsPage'
 import {
   AlertTriangle,
-  BarChart3,
   Bot,
-  Boxes,
-  Building2,
-  CalendarDays,
   CheckCircle2,
   Clock3,
-  FileSpreadsheet,
-  Gauge,
+  Database,
+  FileText,
   History,
   LayoutGrid,
   LineChart,
-  Link,
-  ListChecks,
+  Map as MapIcon,
   MessageSquare,
   Paintbrush,
   PlugZap,
   Plus,
-  RefreshCw,
+  Search,
   Send,
   Settings,
   Share2,
@@ -55,6 +53,8 @@ type View =
   | 'planning'
   | 'benchmarks'
   | 'mapping'
+  | 'eliminations'
+  | 'fslibrary'
   | 'flux'
   | 'report-studio'
   | 'statements'
@@ -265,6 +265,7 @@ function App() {
   const [toast, setToast] = useState<string | null>(null)
   const [mappingRefreshKey, setMappingRefreshKey] = useState(0)
   const [loadError, setLoadError] = useState<string | null>(null)
+  const [paletteOpen, setPaletteOpen] = useState(false)
 
   const selectedPackageByContext = packages.find((p) => p.organizationKey === selectedOrganizationKey && p.periodKey === selectedPeriodKey)
   const selectedPackageById = packages.find((p) => p.id === selectedPackageId)
@@ -322,6 +323,18 @@ function App() {
     return () => {
       cancelled = true
     }
+  }, [])
+
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      const isModifier = event.metaKey || event.ctrlKey
+      if (isModifier && event.key.toLowerCase() === 'k') {
+        event.preventDefault()
+        setPaletteOpen((current) => !current)
+      }
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
   }, [])
 
   useEffect(() => {
@@ -412,10 +425,9 @@ function App() {
         selectedOrganizationKey={selectedOrganizationKey}
         selectedPeriodKey={selectedPeriodKey}
         onSelect={selectReportingContext}
-        view={view}
-          setView={setView}
-          selectedPackage={selectedPackage}
-        />
+        selectedPackage={selectedPackage}
+        onOpenPalette={() => setPaletteOpen(true)}
+      />
       <main className="workspace" id="main-content" aria-label="Main workspace">
         <Sidebar
           packageData={selectedPackage}
@@ -423,7 +435,6 @@ function App() {
           selectedSlideId={selectedSlideId}
           openSlide={openSlide}
           setView={setView}
-          recompile={recompile}
           hasPackage={hasSelectedPackage}
         />
         <section className={panel ? 'content with-panel' : 'content'}>
@@ -457,6 +468,8 @@ function App() {
             />
           )}
           {!loadError && view === 'mapping' && <MappingView organizationKey={selectedOrganizationKey} periodKey={selectedPeriodKey} refreshKey={mappingRefreshKey} openAccount={(accountId) => setPanel({ type: 'account', accountId })} />}
+          {!loadError && view === 'fslibrary' && <FsLibraryView organizationKey={selectedOrganizationKey} />}
+          {!loadError && view === 'eliminations' && <EliminationsView organizationKey={selectedOrganizationKey} periodKey={selectedPeriodKey} />}
           {!loadError && hasSelectedPackage && view === 'planning' && <PlanningView packageData={selectedPackage} />}
           {!loadError && hasSelectedPackage && view === 'benchmarks' && <BenchmarkingView packageData={selectedPackage} />}
           {!loadError && hasSelectedPackage && view === 'flux' && <FluxReviewPanel packageData={selectedPackage} refreshPackages={refreshPackages} standalone onAiRunQueued={(run) => setAiRuns((current) => [run, ...current.filter((x) => x.id !== run.id)].slice(0, 8))} />}
@@ -472,6 +485,28 @@ function App() {
         </section>
       </main>
 
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        organizations={reportingContext.organizations.map((organization) => ({
+          key: organization.key,
+          name: organization.name,
+          abbreviation: organization.abbreviation,
+        }))}
+        periods={reportingContext.periods.map((period) => ({ key: period.key, label: period.label }))}
+        slides={selectedPackage.slides.map((slide) => ({
+          id: slide.id,
+          sortOrder: slide.sortOrder,
+          subject: slide.subject,
+          kpiLabel: slide.kpiLabel,
+        }))}
+        hasPackage={hasSelectedPackage}
+        selectedOrganizationKey={selectedOrganizationKey}
+        onView={(nextView) => setView(nextView as View)}
+        onSelectOrganization={(organizationKey) => selectReportingContext(organizationKey, selectedPeriodKey)}
+        onSelectPeriod={(periodKey) => selectReportingContext(selectedOrganizationKey, periodKey)}
+        onOpenSlide={(slideId) => openSlide(slideId)}
+      />
       {hasSelectedPackage && panel?.type === 'chat' && selectedSlide && <ChatPanel slide={selectedSlide} onClose={() => setPanel(null)} />}
       {hasSelectedPackage && panel?.type === 'history' && selectedSlide && <HistoryPanel packageData={selectedPackage} slide={selectedSlide} onClose={() => setPanel(null)} refreshPackages={refreshPackages} />}
       {panel?.type === 'account' && <AccountPanel accountId={panel.accountId} organizationKey={selectedOrganizationKey} onClose={() => setPanel(null)} onChanged={() => { setToast('Mapping updated.'); setMappingRefreshKey((key) => key + 1); refreshPackages().catch(() => undefined) }} />}
@@ -481,24 +516,26 @@ function App() {
   )
 }
 
+/**
+ * CS Redesign v3 TopBar — 48px tall, IBM Plex Sans.
+ * Brand square + name, vertical divider, entity/month/year split-pill selector,
+ * sync + issues status pills, search button (⌘K hint), avatar.
+ */
 function TopBar({
   reportingContext,
   selectedOrganizationKey,
   selectedPeriodKey,
   onSelect,
-  view,
-  setView,
   selectedPackage,
+  onOpenPalette,
 }: {
   reportingContext: ReportingContext
   selectedOrganizationKey: string
   selectedPeriodKey: string
   onSelect: (organizationKey: string, periodKey: string) => void
-  view: View
-  setView: (view: View) => void
   selectedPackage: PackageDto
+  onOpenPalette: () => void
 }) {
-  const selectedPackageOption = reportingContext.packages.find((item) => item.organizationKey === selectedOrganizationKey && item.periodKey === selectedPeriodKey)
   const selectedPeriod = reportingContext.periods.find((item) => item.key === selectedPeriodKey)
   const hasMappedXeroOrganizations = reportingContext.organizations.some((organization) => organization.isXeroMapped)
   const organizations = reportingContext.organizations.filter((organization) => {
@@ -506,73 +543,204 @@ function TopBar({
     if (organization.isConsolidated) return false
     return hasMappedXeroOrganizations ? organization.isXeroMapped : true
   })
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+  const periodMonth = selectedPeriod ? months[(selectedPeriod.periodStart ? new Date(selectedPeriod.periodStart).getUTCMonth() : 0)] : ''
+  const periodYear = selectedPeriod ? new Date(selectedPeriod.periodStart).getUTCFullYear() : new Date().getUTCFullYear()
+
+  const monthOptions = reportingContext.periods.filter((p) => new Date(p.periodStart).getUTCFullYear() === periodYear)
+  const yearOptions = Array.from(new Set(reportingContext.periods.map((p) => new Date(p.periodStart).getUTCFullYear()))).sort()
+
+  const openIssues = (selectedPackage.issues ?? []).filter((i) => i.status === 'Open').length
+  const lastSync = formatRelative(selectedPackage.lastXeroSyncAt)
+  const isSyncFresh = isWithinLastHour(selectedPackage.lastXeroSyncAt)
 
   return (
-    <header className="topbar" role="banner">
-      <div className="brand">
-        <div className="brand-mark">L</div>
-        <div>
-          <div className="brand-name">Ledgerline</div>
-          <div className="brand-tag">BOARD PACKAGES</div>
-        </div>
+    <header className="cs-topbar" role="banner">
+      <div className="cs-brand">
+        <div className="cs-brand-mark">C</div>
+        <span className="cs-brand-name">CloseSoftware</span>
       </div>
-      <div className="context-switcher" aria-label="Reporting context">
-        <div className="context-heading">
-          <span>Entity period</span>
-          <strong>{selectedPackageOption ? selectedPackageOption.status : 'Data only'}</strong>
-        </div>
-        <label className="context-field entity-field">
-          <span><Building2 size={13} /> Entity</span>
-          <select value={selectedOrganizationKey} onChange={(event) => onSelect(event.target.value, selectedPeriodKey)} disabled={organizations.length === 0}>
-            {organizations.length === 0 && <option value="">No Xero entities</option>}
+
+      <div className="cs-topbar-divider" />
+
+      <div className="cs-context-pill" aria-label="Reporting context">
+        <div className="cs-context-field">
+          <span className="cs-context-label">Entity</span>
+          <select
+            value={selectedOrganizationKey}
+            onChange={(event) => onSelect(event.target.value, selectedPeriodKey)}
+            disabled={organizations.length === 0}
+          >
+            {organizations.length === 0 && <option value="">No entities</option>}
             {organizations.map((organization) => (
-              <option key={organization.key} value={organization.key}>
-                {organization.name}
-              </option>
+              <option key={organization.key} value={organization.key}>{organization.name}</option>
             ))}
           </select>
-        </label>
-        <label className="context-field">
-          <span><CalendarDays size={13} /> Period</span>
-          <select value={selectedPeriodKey} onChange={(event) => onSelect(selectedOrganizationKey, event.target.value)} disabled={reportingContext.periods.length === 0}>
-            {reportingContext.periods.length === 0 && <option value="">No data-backed periods</option>}
-            {reportingContext.periods.map((period) => (
-              <option key={period.key} value={period.key}>
-                {period.label}
-              </option>
+        </div>
+        <div className="cs-context-divider" />
+        <div className="cs-context-field">
+          <span className="cs-context-label">Month</span>
+          <select
+            value={selectedPeriodKey}
+            onChange={(event) => onSelect(selectedOrganizationKey, event.target.value)}
+            disabled={monthOptions.length === 0}
+          >
+            {monthOptions.length === 0 && <option value="">—</option>}
+            {monthOptions.map((period) => (
+              <option key={period.key} value={period.key}>{period.label.split(' ')[0]}</option>
             ))}
           </select>
-        </label>
-        <div className="context-meta" title="Reporting periods are created by Xero when source activity exists.">
-          <span>Xero freshness</span>
-          <strong>{formatRelative(selectedPackage.lastXeroSyncAt)}</strong>
         </div>
-        <div className="context-meta" title="Trial Balance reconciliation status is checked by the Xero coverage job.">
-          <span>TB</span>
-          <strong>{selectedPeriod?.ledgerActivityCount ? `${selectedPeriod.ledgerActivityCount} journals` : 'No journals'}</strong>
-        </div>
-        <div className={selectedPackage.isSourceDataStale || selectedPackage.blockReason ? 'context-meta stale' : 'context-meta'} title={selectedPackage.blockReason ?? selectedPackage.sourceDataStaleReason ?? 'Package is current with known source data.'}>
-          <span>Package</span>
-          <strong>{selectedPackage.blockReason ? 'Needs attention' : selectedPackage.isSourceDataStale ? 'Stale' : selectedPackageOption ? 'Current' : 'Not started'}</strong>
+        <div className="cs-context-divider" />
+        <div className="cs-context-field">
+          <span className="cs-context-label">Year</span>
+          <select
+            value={String(periodYear)}
+            onChange={(event) => {
+              // Find any period in the chosen year and switch to it (default: same month if available, else first).
+              const targetYear = Number(event.target.value)
+              const sameMonth = reportingContext.periods.find((p) => new Date(p.periodStart).getUTCFullYear() === targetYear && months[new Date(p.periodStart).getUTCMonth()] === periodMonth)
+              const fallback = reportingContext.periods.find((p) => new Date(p.periodStart).getUTCFullYear() === targetYear)
+              const next = sameMonth ?? fallback
+              if (next) onSelect(selectedOrganizationKey, next.key)
+            }}
+          >
+            {yearOptions.map((y) => <option key={y} value={String(y)}>{y}</option>)}
+          </select>
         </div>
       </div>
+
+      <div className="cs-status-row">
+        <span className={`cs-status-pill ${isSyncFresh ? 'good' : 'warn'}`} title={`Last Xero sync ${lastSync}`}>
+          <span className="cs-status-dot" />
+          <span className="mono">{lastSync}</span>
+        </span>
+        {openIssues > 0 && (
+          <span className="cs-status-pill warn" title={`${openIssues} open issue${openIssues === 1 ? '' : 's'}`}>
+            <span className="cs-status-dot" />
+            <span className="mono">{openIssues} {openIssues === 1 ? 'issue' : 'issues'}</span>
+          </span>
+        )}
+      </div>
+
       <div className="spacer" />
-      <div className="segmented">
-        <SegmentButton active={view === 'dashboard' || view === 'slide'} onClick={() => setView('dashboard')} icon={<Boxes size={15} />}>
-          Editor
-        </SegmentButton>
-        <SegmentButton active={view === 'livedash'} onClick={() => setView('livedash')} icon={<Gauge size={15} />}>
-          Live Dashboard
-        </SegmentButton>
-        <SegmentButton active={view === 'output'} onClick={() => setView('output')} icon={<Share2 size={15} />}>
-          Share
-        </SegmentButton>
-      </div>
-      <button className="icon-button" onClick={() => setView('settings')} title="Settings">
-        <Settings size={17} />
+
+      <button
+        className="cs-search-button"
+        type="button"
+        onClick={onOpenPalette}
+        title="Search (⌘K)"
+        aria-label="Open command palette"
+      >
+        <Search size={13} aria-hidden />
+        <span>Search…</span>
+        <span className="cs-kbd mono">⌘K</span>
       </button>
-      <div className="avatar">MP</div>
+
+      <div className="cs-avatar" aria-label="Account">MP</div>
     </header>
+  )
+}
+
+/**
+ * CS Redesign v3 Sidebar — 224px wide, IBM Plex Sans.
+ * Entity context card, Workflow group, Mapping & Eliminations accordion,
+ * Financial Package accordion (with numbered slide list), Package tools footer.
+ */
+
+const MAPPING_SUB_VIEWS: View[] = ['mapping', 'fslibrary', 'eliminations']
+const PACKAGE_SUB_VIEWS: View[] = ['dashboard', 'slide']
+
+function CsSidebarItem({
+  active,
+  icon,
+  label,
+  onClick,
+  hasIssue,
+}: {
+  active: boolean
+  icon: React.ReactNode
+  label: string
+  onClick: () => void
+  hasIssue?: boolean
+}) {
+  return (
+    <button
+      type="button"
+      className={`cs-side-item ${active ? 'active' : ''}`}
+      onClick={onClick}
+      aria-current={active ? 'page' : undefined}
+    >
+      <span className="cs-side-icon" aria-hidden>{icon}</span>
+      <span className="cs-side-label">{label}</span>
+      {hasIssue && <span className="cs-side-issue-dot" aria-label="Issue" />}
+    </button>
+  )
+}
+
+function CsSidebarLabel({ children }: { children: React.ReactNode }) {
+  return <div className="cs-side-eyebrow">{children}</div>
+}
+
+function CsSidebarAccordion({
+  label,
+  icon,
+  isOpen,
+  onToggle,
+  children,
+  active,
+}: {
+  label: string
+  icon: React.ReactNode
+  isOpen: boolean
+  onToggle: () => void
+  children: React.ReactNode
+  active: boolean
+}) {
+  return (
+    <div className="cs-side-accordion">
+      <button
+        type="button"
+        className={`cs-side-item cs-side-accordion-toggle ${active ? 'active' : ''}`}
+        onClick={onToggle}
+        aria-expanded={isOpen}
+      >
+        <span className="cs-side-icon" aria-hidden>{icon}</span>
+        <span className="cs-side-label">{label}</span>
+        <span className="cs-side-chev" aria-hidden>{isOpen ? '▾' : '▸'}</span>
+      </button>
+      {isOpen && <div className="cs-side-accordion-body">{children}</div>}
+    </div>
+  )
+}
+
+function CsSidebarSubItem({
+  active,
+  label,
+  icon,
+  onClick,
+  index,
+  hasIssue,
+}: {
+  active: boolean
+  label: string
+  icon?: React.ReactNode
+  onClick: () => void
+  index?: number
+  hasIssue?: boolean
+}) {
+  return (
+    <button
+      type="button"
+      className={`cs-side-sub ${active ? 'active' : ''}`}
+      onClick={onClick}
+      aria-current={active ? 'page' : undefined}
+    >
+      {icon && <span className="cs-side-icon" aria-hidden>{icon}</span>}
+      {index !== undefined && <span className="cs-side-sub-index mono">{String(index).padStart(2, '0')}</span>}
+      <span className="cs-side-label">{label}</span>
+      {hasIssue && <span className="cs-side-issue-dot small" aria-label="Issue" />}
+    </button>
   )
 }
 
@@ -582,7 +750,6 @@ function Sidebar({
   selectedSlideId,
   openSlide,
   setView,
-  recompile,
   hasPackage,
 }: {
   packageData: PackageDto
@@ -590,72 +757,90 @@ function Sidebar({
   selectedSlideId: string
   openSlide: (id: string) => void
   setView: (view: View) => void
-  recompile: () => void
   hasPackage: boolean
 }) {
+  const [mappingOpen, setMappingOpen] = useState(false)
+  const [pkgOpen, setPkgOpen] = useState(false)
+  const issuesBySlide = new Map<string, IssueDto>()
+  for (const issue of (packageData.issues ?? [])) {
+    if (issue.packageSlideId && issue.status === 'Open') issuesBySlide.set(issue.packageSlideId, issue)
+  }
+  const isMappingActive = MAPPING_SUB_VIEWS.includes(view)
+  const isPackageActive = PACKAGE_SUB_VIEWS.includes(view)
+
+  // Auto-open accordions when their views are active so navigation feels coherent.
+  useEffect(() => { if (isMappingActive) setMappingOpen(true) }, [isMappingActive])
+  useEffect(() => { if (isPackageActive) setPkgOpen(true) }, [isPackageActive])
+
+  const fresh = isWithinLastHour(packageData.lastXeroSyncAt)
+
   return (
-    <aside className="sidebar" role="navigation" aria-label="Primary">
-      <div className="period-card">
-        <span>Selected context</span>
-        <strong>{packageData.organizationName}</strong>
-        <small>{packageData.period} · {packageData.id ? packageData.versionLabel : 'data only'}</small>
+    <aside className="cs-sidebar" role="navigation" aria-label="Primary">
+      <div className="cs-entity-card">
+        <div className="cs-eyebrow">Selected entity</div>
+        <div className="cs-entity-name">{packageData.organizationName || '—'}</div>
+        <div className="cs-entity-period">{packageData.period}</div>
+        <div className="cs-entity-meta">
+          <span className="cs-version-chip">{packageData.versionLabel || 'v1'} {packageData.id ? '' : 'Data only'}</span>
+          <span className="cs-sync-indicator">
+            <span className={`cs-sync-dot ${fresh ? 'good' : 'idle'}`} />
+            <span>{formatRelative(packageData.lastXeroSyncAt)}</span>
+          </span>
+        </div>
       </div>
-      <div className="rail-label">Workflow</div>
-      <RailItem active={view === 'dashboard' || view === 'livedash'} icon={<Gauge size={15} />} onClick={() => setView('dashboard')}>
-        Entity dashboard
-      </RailItem>
-      <RailItem active={view === 'mapping'} icon={<ListChecks size={15} />} onClick={() => setView('mapping')}>
-        Mapping & eliminations
-      </RailItem>
-      <RailItem active={view === 'planning'} icon={<LineChart size={15} />} onClick={() => setView('planning')}>
-        Planning & forecast
-      </RailItem>
-      <RailItem active={view === 'benchmarks'} icon={<BarChart3 size={15} />} onClick={() => setView('benchmarks')}>
-        Benchmarks
-      </RailItem>
-      <RailItem active={view === 'flux'} icon={<MessageSquare size={15} />} onClick={() => setView('flux')}>
-        Flux review
-      </RailItem>
-      <RailItem active={view === 'dashboard' || view === 'slide'} icon={<Boxes size={15} />} onClick={() => setView('dashboard')}>
-        Financial package
-      </RailItem>
-      <RailItem active={view === 'report-studio'} icon={<LayoutGrid size={15} />} onClick={() => setView('report-studio')}>
-        Reporting studio
-      </RailItem>
-      <RailItem active={view === 'statements'} icon={<FileSpreadsheet size={15} />} onClick={() => setView('statements')}>
-        Statements & transactions
-      </RailItem>
-      <RailItem active={view === 'library'} icon={<History size={15} />} onClick={() => setView('library')}>
-        Reporting library
-      </RailItem>
-      <RailItem active={view === 'parity'} icon={<CheckCircle2 size={15} />} onClick={() => setView('parity')}>
-        Competitor parity
-      </RailItem>
-      <div className="rail-label">Package slides</div>
-      {!hasPackage && <div className="rail-empty">No package has been created for this entity and period.</div>}
-      {hasPackage && (
-        <RailItem active={view === 'dashboard'} icon={<Boxes size={15} />} onClick={() => setView('dashboard')}>
-          Package overview
-        </RailItem>
-      )}
-      {packageData.slides.map((slide) => {
-        const issue = packageData.issues.find((x) => x.packageSlideId === slide.id && x.status === 'Open')
-        return (
-          <RailItem key={slide.id} active={view === 'slide' && selectedSlideId === slide.id} badge={issue?.severity} icon={<span className="mono">0{slide.sortOrder}</span>} onClick={() => openSlide(slide.id)}>
-            {slide.subject}
-          </RailItem>
-        )
-      })}
-      <div className="rail-label">Package tools</div>
-      <RailItem disabled={!hasPackage} icon={<RefreshCw size={15} />} onClick={recompile}>
-        Recompile package
-      </RailItem>
-      <RailItem active={view === 'output'} icon={<Link size={15} />} onClick={() => setView('output')}>
-        Share & export
-      </RailItem>
-      <RailItem active={view === 'settings' || view === 'ai-settings' || view === 'xero-settings' || view === 'branding' || view === 'layouts'} icon={<Settings size={15} />} onClick={() => setView('settings')}>
-        Settings
-      </RailItem>
+
+      <div className="cs-side-scroll">
+        <CsSidebarLabel>Workflow</CsSidebarLabel>
+        <CsSidebarItem active={view === 'dashboard'} icon={<LayoutGrid size={14} />} label="Entity Dashboard" onClick={() => setView('dashboard')} />
+        <CsSidebarItem active={view === 'flux'} icon={<MessageSquare size={14} />} label="Flux Review" onClick={() => setView('flux')} hasIssue={(packageData.issues ?? []).some((i) => i.status === 'Open' && i.category?.toLowerCase().includes('flux'))} />
+        <CsSidebarItem active={view === 'statements'} icon={<Database size={14} />} label="Statements & Transactions" onClick={() => setView('statements')} />
+        <CsSidebarItem active={view === 'library'} icon={<History size={14} />} label="Reporting Library" onClick={() => setView('library')} />
+        <CsSidebarItem active={view === 'livedash'} icon={<LineChart size={14} />} label="Live Dashboard" onClick={() => setView('livedash')} />
+
+        <CsSidebarAccordion
+          label="Mapping & Eliminations"
+          icon={<MapIcon size={14} />}
+          isOpen={mappingOpen}
+          onToggle={() => { setMappingOpen((o) => !o); if (!mappingOpen) setView('mapping') }}
+          active={isMappingActive}
+        >
+          <CsSidebarSubItem active={view === 'mapping'} icon={<MapIcon size={12} />} label="Account Mapping" onClick={() => setView('mapping')} />
+          <CsSidebarSubItem active={view === 'fslibrary'} icon={<FileText size={12} />} label="FS Line Library" onClick={() => setView('fslibrary')} />
+          <CsSidebarSubItem active={view === 'eliminations'} icon={<X size={12} />} label="Eliminations" onClick={() => setView('eliminations')} />
+        </CsSidebarAccordion>
+
+        <CsSidebarAccordion
+          label="Financial Package"
+          icon={<LayoutGrid size={14} />}
+          isOpen={pkgOpen}
+          onToggle={() => { setPkgOpen((o) => !o); if (!pkgOpen) setView('dashboard') }}
+          active={isPackageActive}
+        >
+          <CsSidebarSubItem active={view === 'dashboard'} icon={<LayoutGrid size={12} />} label="Package Overview" onClick={() => setView('dashboard')} />
+          {!hasPackage && <div className="cs-side-empty">No package for this entity & period.</div>}
+          {packageData.slides.map((slide) => (
+            <CsSidebarSubItem
+              key={slide.id}
+              active={view === 'slide' && selectedSlideId === slide.id}
+              index={slide.sortOrder}
+              label={slide.subject}
+              onClick={() => openSlide(slide.id)}
+              hasIssue={issuesBySlide.has(slide.id)}
+            />
+          ))}
+        </CsSidebarAccordion>
+      </div>
+
+      <div className="cs-side-footer">
+        <CsSidebarLabel>Package tools</CsSidebarLabel>
+        <CsSidebarItem active={view === 'output'} icon={<Share2 size={14} />} label="Share & Export" onClick={() => setView('output')} />
+        <CsSidebarItem
+          active={view === 'settings' || view === 'ai-settings' || view === 'xero-settings' || view === 'branding' || view === 'layouts'}
+          icon={<Settings size={14} />}
+          label="Settings"
+          onClick={() => setView('settings')}
+        />
+      </div>
     </aside>
   )
 }
@@ -941,6 +1126,11 @@ function formatRelative(value: string | null) {
   if (!value) return '—'
   const minutes = Math.max(1, Math.round((Date.now() - new Date(value).getTime()) / 60000))
   return minutes < 60 ? `${minutes} min ago` : `${Math.round(minutes / 60)} hr ago`
+}
+
+function isWithinLastHour(value: string | null) {
+  if (!value) return false
+  return (Date.now() - new Date(value).getTime()) < 1000 * 60 * 60
 }
 
 

@@ -813,14 +813,16 @@ export function CompositionChart({
     rows.reduce((sum, account) => sum + Math.abs(account.current), 0),
     1,
   )
-  let offset = 0
   const stops = rows
-    .map((account, index) => {
+    .reduce<{ offset: number; segments: string[] }>((state, account, index) => {
       const share = (Math.abs(account.current) / total) * 100
-      const start = offset
-      offset += share
-      return `var(--chart-${(index % 5) + 1}) ${start}% ${offset}%`
-    })
+      const nextOffset = state.offset + share
+      return {
+        offset: nextOffset,
+        segments: [...state.segments, `var(--chart-${(index % 5) + 1}) ${state.offset}% ${nextOffset}%`],
+      }
+    }, { offset: 0, segments: [] })
+    .segments
     .join(', ')
   return (
     <div className="composition-chart">

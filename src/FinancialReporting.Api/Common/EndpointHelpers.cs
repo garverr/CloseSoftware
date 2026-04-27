@@ -6,6 +6,7 @@ using FinancialReporting.Api.Data;
 using FinancialReporting.Api.Domain;
 using FinancialReporting.Api.Services;
 using Microsoft.AspNetCore.Http;
+using Microsoft.EntityFrameworkCore;
 
 namespace FinancialReporting.Api.Common;
 
@@ -26,14 +27,15 @@ public static class EndpointHelpers
             return claimRoles.Any(role => roles.Contains(role, StringComparer.OrdinalIgnoreCase));
         }
 
+        if (!AuthBypass.AllowDevAdminBypass)
+        {
+            return false;
+        }
+
         var roleHeader = http.Request.Headers["X-FR-Role"].FirstOrDefault();
         string[] activeRoles;
         if (string.IsNullOrWhiteSpace(roleHeader))
         {
-            if (!AuthBypass.AllowDevAdminBypass)
-            {
-                return false;
-            }
             activeRoles = ["Admin"];
         }
         else
@@ -52,10 +54,13 @@ public static class EndpointHelpers
                    ?? http.User.Identity.Name
                    ?? "authenticated";
         }
-        var supplied = http.Request.Headers["X-FR-User"].FirstOrDefault();
-        if (!string.IsNullOrWhiteSpace(supplied))
+        if (AuthBypass.AllowDevAdminBypass)
         {
-            return supplied;
+            var supplied = http.Request.Headers["X-FR-User"].FirstOrDefault();
+            if (!string.IsNullOrWhiteSpace(supplied))
+            {
+                return supplied;
+            }
         }
         return AuthBypass.AllowDevAdminBypass ? "dev-admin" : "anonymous";
     }
@@ -66,12 +71,60 @@ public static class EndpointHelpers
         {
             return http.User.FindFirst(ClaimTypes.Role)?.Value ?? "User";
         }
-        var supplied = http.Request.Headers["X-FR-Role"].FirstOrDefault();
-        if (!string.IsNullOrWhiteSpace(supplied))
+        if (AuthBypass.AllowDevAdminBypass)
         {
-            return supplied;
+            var supplied = http.Request.Headers["X-FR-Role"].FirstOrDefault();
+            if (!string.IsNullOrWhiteSpace(supplied))
+            {
+                return supplied;
+            }
         }
         return AuthBypass.AllowDevAdminBypass ? "Admin" : "Anonymous";
+    }
+
+    public static IResult? RejectIfApproved(ReportPackage package)
+        => package.IsApproved
+            ? Results.Conflict(new
+            {
+                error = "Package is approved and locked. Unapprove it before making changes.",
+                package.ApprovedBy,
+                package.ApprovedAt,
+                package.ApprovedVersionId
+            })
+            : null;
+
+    public static async Task<IResult?> RejectIfPackageApprovedAsync(AppDbContext db, Guid packageId, CancellationToken ct)
+    {
+        var package = await db.ReportPackages
+            .AsNoTracking()
+            .Where(x => x.Id == packageId)
+            .Select(x => new ReportPackage
+            {
+                Id = x.Id,
+                IsApproved = x.IsApproved,
+                ApprovedBy = x.ApprovedBy,
+                ApprovedAt = x.ApprovedAt,
+                ApprovedVersionId = x.ApprovedVersionId
+            })
+            .FirstOrDefaultAsync(ct);
+        return package is null ? Results.NotFound() : RejectIfApproved(package);
+    }
+
+    public static async Task<IResult?> RejectIfFluxGroupPackageApprovedAsync(AppDbContext db, Guid groupId, CancellationToken ct)
+    {
+        var package = await db.FluxReviewGroups
+            .AsNoTracking()
+            .Where(x => x.Id == groupId)
+            .Join(db.ReportPackages.AsNoTracking(), group => group.ReportPackageId, package => package.Id, (_, package) => new ReportPackage
+            {
+                Id = package.Id,
+                IsApproved = package.IsApproved,
+                ApprovedBy = package.ApprovedBy,
+                ApprovedAt = package.ApprovedAt,
+                ApprovedVersionId = package.ApprovedVersionId
+            })
+            .FirstOrDefaultAsync(ct);
+        return package is null ? Results.NotFound() : RejectIfApproved(package);
     }
 
     public static Task AuditAsync(

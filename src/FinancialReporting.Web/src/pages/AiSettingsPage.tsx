@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { fetchJson, postJson } from '../api/client'
+import { fetchJson, putJson } from '../api/client'
 import { Button, Card } from '../components/primitives'
 import { Check } from 'lucide-react'
 
@@ -35,7 +35,7 @@ export function AiSettings() {
 
   const normalized = AI_SETTING_MODULES.map((module) => settings.find((s) => s.module === module) ?? { module, model: models[0]?.id ?? 'gpt-5.5', reasoningEffort: 'high', profile: module, enabled: true })
   const update = (module: string, patch: Partial<AiSetting>) => setSettings(normalized.map((setting) => (setting.module === module ? { ...setting, ...patch } : setting)))
-  const save = async () => postJson('/api/settings/ai-runtime', normalized)
+  const save = async () => putJson('/api/settings/ai-runtime', normalized)
 
   return (
     <div className="page">

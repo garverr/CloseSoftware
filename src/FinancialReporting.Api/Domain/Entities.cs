@@ -766,6 +766,7 @@ public sealed class RecurringEliminationRule
     public string Type { get; set; } = "EliminateAccount";
     public string Description { get; set; } = "";
     public string CriteriaJson { get; set; } = "{}";
+    public decimal Amount { get; set; }
     public string Reason { get; set; } = "";
     public bool IsActive { get; set; } = true;
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;

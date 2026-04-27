@@ -518,10 +518,44 @@ public static class MappingEndpoints
             return Results.Ok(AccountDto.From(account));
         });
 
-        app.MapGet("/api/mapping/recurring-eliminations", async (AppDbContext db, CancellationToken ct) =>
+        app.MapGet("/api/mapping/recurring-eliminations", async (
+            string? organizationKey,
+            string? periodKey,
+            AppDbContext db,
+            CancellationToken ct) =>
         {
-            var rules = await db.RecurringEliminationRules.AsNoTracking().ToListAsync(ct);
-            return Results.Ok(rules.OrderByDescending(x => x.CreatedAt));
+            var query = db.RecurringEliminationRules.AsNoTracking().AsQueryable();
+
+            if (!string.IsNullOrWhiteSpace(organizationKey))
+            {
+                var organizationId = await db.Organizations
+                    .AsNoTracking()
+                    .Where(x => x.Key == organizationKey)
+                    .Select(x => (Guid?)x.Id)
+                    .FirstOrDefaultAsync(ct);
+                if (organizationId is null)
+                {
+                    return Results.Ok(Array.Empty<RecurringEliminationRule>());
+                }
+                query = query.Where(x => x.OrganizationId == organizationId.Value);
+            }
+
+            if (!string.IsNullOrWhiteSpace(periodKey))
+            {
+                var reportingPeriodId = await db.ReportingPeriods
+                    .AsNoTracking()
+                    .Where(x => x.Key == periodKey)
+                    .Select(x => (Guid?)x.Id)
+                    .FirstOrDefaultAsync(ct);
+                if (reportingPeriodId is null)
+                {
+                    return Results.Ok(Array.Empty<RecurringEliminationRule>());
+                }
+                query = query.Where(x => x.ReportingPeriodId == reportingPeriodId.Value);
+            }
+
+            var rules = await query.OrderByDescending(x => x.CreatedAt).ToListAsync(ct);
+            return Results.Ok(rules);
         });
 
         app.MapPost("/api/mapping/recurring-eliminations", async (
@@ -549,6 +583,7 @@ public static class MappingEndpoints
                 Type = request.Type,
                 Description = request.Description,
                 CriteriaJson = request.CriteriaJson,
+                Amount = request.Amount,
                 Reason = request.Reason,
                 IsActive = request.IsActive
             };

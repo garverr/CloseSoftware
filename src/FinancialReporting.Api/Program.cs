@@ -26,6 +26,7 @@ using FinancialReporting.Api.Services;
 using static FinancialReporting.Api.Common.EndpointHelpers;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.EntityFrameworkCore;
@@ -236,6 +237,18 @@ if (app.Environment.IsDevelopment())
 
 app.UseCors();
 app.UseAuthentication();
+app.Use(async (context, next) =>
+{
+    if (!app.Environment.IsDevelopment()
+        && RequiresAuthentication(context.Request.Path)
+        && context.User?.Identity?.IsAuthenticated != true)
+    {
+        await context.ChallengeAsync();
+        return;
+    }
+
+    await next();
+});
 app.UseAuthorization();
 
 await using (var scope = app.Services.CreateAsyncScope())
@@ -264,7 +277,11 @@ await using (var scope = app.Services.CreateAsyncScope())
     await RealDataCleanupService.PurgeRuntimeMockDataAsync(db, CancellationToken.None);
 }
 
-app.MapHub<AiHub>("/hubs/ai");
+var aiHub = app.MapHub<AiHub>("/hubs/ai");
+if (!app.Environment.IsDevelopment())
+{
+    aiHub.RequireAuthorization();
+}
 
 // All endpoints live in Features/<Feature>/<Feature>Endpoints.cs. Each feature exposes a
 // MapXxxEndpoints extension method on IEndpointRouteBuilder that registers its routes,
@@ -288,6 +305,12 @@ app.MapReportingEndpoints();
 app.MapReportingPeriodEndpoints();
 app.MapSlideBlockVersionEndpoints();
 app.MapXeroEndpoints();
+
+static bool RequiresAuthentication(PathString path)
+    => (path.StartsWithSegments("/api")
+        && !path.StartsWithSegments("/api/health")
+        && !path.StartsWithSegments("/api/xero/callback"))
+       || path.StartsWithSegments("/hubs");
 
 app.Run();
 
@@ -329,7 +352,7 @@ public sealed record RejectDraftRequest(string? Reason);
 public sealed record SplitMappingLineRequest(string FsLine, decimal Percent);
 public sealed record SplitMappingRequest(SplitMappingLineRequest[] Lines, string Reason);
 public sealed record MappingReasonRequest(string Reason);
-public sealed record RecurringEliminationRuleRequest(Guid OrganizationId, Guid ReportingPeriodId, Guid? GlAccountId, string Type, string Description, string CriteriaJson, string Reason, bool IsActive);
+public sealed record RecurringEliminationRuleRequest(Guid OrganizationId, Guid ReportingPeriodId, Guid? GlAccountId, string Type, string Description, string CriteriaJson, decimal Amount, string Reason, bool IsActive);
 public sealed record CreateExportQaRequest(Guid? ReportPackageId);
 public sealed record UpdateShareLinkRequest(bool? RequirePassword, bool? AllowDownload, bool? DashboardOnly, bool ExpiresAtSet, DateTimeOffset? ExpiresAt, string? Password);
 public sealed record UpsertKpiRequest(Guid OrganizationId, string Name, string Category, string Formula, string Unit, decimal CurrentValue, decimal TargetValue, bool IsPinned, bool HigherIsBetter);
