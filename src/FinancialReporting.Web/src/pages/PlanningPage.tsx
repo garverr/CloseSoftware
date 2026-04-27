@@ -269,17 +269,18 @@ export function PlanningView({ packageData }: { packageData: PackageDto }) {
   }, [load])
 
   const active = overview?.scenarios.find((scenario) => scenario.id === selectedScenarioId) ?? overview?.scenarios[0]
+  const activeId = active?.id
   const editable = active ? { ...active, ...draft } : null
   const rows = editable?.rows ?? []
   const firstBreach = rows.find((row) => row.cashThresholdBreached)
   const lastRow = rows[rows.length - 1]
 
   useEffect(() => {
-    if (!active) return
-    fetchJson<CashTimingDto>(`/api/planning/${packageData.id}/cash-timing?scenarioId=${active.id}&granularity=${cashGranularity}&months=3`)
+    if (!activeId) return
+    fetchJson<CashTimingDto>(`/api/planning/${packageData.id}/cash-timing?scenarioId=${activeId}&granularity=${cashGranularity}&months=3`)
       .then(setCashTiming)
       .catch(() => setCashTiming(null))
-  }, [active?.id, cashGranularity, packageData.id])
+  }, [activeId, cashGranularity, packageData.id])
 
   const updateDraft = (patch: Partial<ForecastScenarioDto>) => setDraft((current) => ({ ...current, ...patch }))
   const scenarioPayload = (scenario: ForecastScenarioDto) => ({

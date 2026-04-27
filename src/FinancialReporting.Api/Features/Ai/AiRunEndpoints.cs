@@ -24,6 +24,10 @@ public static class AiRunEndpoints
             {
                 return Results.Forbid();
             }
+            if (request.ReportPackageId is { } packageId && !await db.ReportPackages.AsNoTracking().AnyAsync(x => x.Id == packageId, ct))
+            {
+                return Results.NotFound();
+            }
             var setting = await db.AiRuntimeSettings.FirstOrDefaultAsync(x => x.Module == request.Module, ct);
             var run = new AiRun
             {
@@ -41,10 +45,14 @@ public static class AiRunEndpoints
             return Results.Accepted($"/api/ai/runs/{run.Id}", AiRunDto.From(run));
         });
 
-        app.MapGet("/api/ai/runs/{runId:guid}", async (Guid runId, AppDbContext db, CancellationToken ct) =>
+        app.MapGet("/api/ai/runs/{runId:guid}", async (Guid runId, HttpContext http, AppDbContext db, CancellationToken ct) =>
         {
             var run = await db.AiRuns.AsNoTracking().FirstOrDefaultAsync(x => x.Id == runId, ct);
-            return run is null ? Results.NotFound() : Results.Ok(AiRunDto.From(run));
+            if (run is null || !await RunIsVisibleAsync(run, http, db, ct))
+            {
+                return Results.NotFound();
+            }
+            return Results.Ok(AiRunDto.From(run));
         });
 
         app.MapPost("/api/ai/runs/{runId:guid}/cancel", async (Guid runId, HttpContext http, AppDbContext db, CancellationToken ct) =>
@@ -55,6 +63,10 @@ public static class AiRunEndpoints
             }
             var run = await db.AiRuns.FirstOrDefaultAsync(x => x.Id == runId, ct);
             if (run is null)
+            {
+                return Results.NotFound();
+            }
+            if (!await RunIsVisibleAsync(run, http, db, ct))
             {
                 return Results.NotFound();
             }
@@ -70,6 +82,16 @@ public static class AiRunEndpoints
         });
 
         return app;
+    }
+
+    private static async Task<bool> RunIsVisibleAsync(AiRun run, HttpContext http, AppDbContext db, CancellationToken ct)
+    {
+        if (run.ReportPackageId is null)
+        {
+            return EndpointHelpers.Can(http, "Admin");
+        }
+
+        return await db.ReportPackages.AsNoTracking().AnyAsync(x => x.Id == run.ReportPackageId.Value, ct);
     }
 }
 

@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises'
+import { readFile, readdir } from 'node:fs/promises'
 
 const frontendUrl = process.env.FRONTEND_URL ?? 'http://127.0.0.1:5173/'
 const apiUrl = process.env.API_URL ?? 'http://localhost:5264'
@@ -25,10 +25,26 @@ async function readText(url) {
   return response.text()
 }
 
+async function readSourceTree(dirUrl) {
+  const entries = await readdir(dirUrl, { withFileTypes: true })
+  const chunks = []
+
+  for (const entry of entries) {
+    const child = new URL(`${entry.name}${entry.isDirectory() ? '/' : ''}`, dirUrl)
+    if (entry.isDirectory()) {
+      chunks.push(await readSourceTree(child))
+    } else if (/\.(ts|tsx)$/.test(entry.name)) {
+      chunks.push(await readFile(child, 'utf8'))
+    }
+  }
+
+  return chunks.join('\n')
+}
+
 const html = await readText(frontendUrl)
 ok(html.includes('id="root"'), 'frontend shell exposes React root')
 
-const appSource = await readFile(new URL('../src/App.tsx', import.meta.url), 'utf8')
+const frontendSource = await readSourceTree(new URL('../src/', import.meta.url))
 const requiredUiWiring = [
   '/api/packages',
   '/api/packages/${selectedPackage.id}/final-review',
@@ -55,7 +71,7 @@ const requiredUiWiring = [
 ]
 
 for (const marker of requiredUiWiring) {
-  ok(appSource.includes(marker), `frontend wired to ${marker}`)
+  ok(frontendSource.includes(marker), `frontend wired to ${marker}`)
 }
 
 const health = await readJson(`${apiUrl}/api/health`)
@@ -96,13 +112,13 @@ const studio = await readJson(`${apiUrl}/api/packages/${currentPackage.id}/repor
 ok(Array.isArray(studio.contentLibrary) && studio.contentLibrary.length > 0, 'reporting studio content library loads')
 ok(Array.isArray(studio.qualityChecks) && studio.qualityChecks.length > 0, 'reporting studio readiness checks load')
 ok(studio.settings && Array.isArray(studio.settings.reportSections), 'reporting studio package settings load')
-ok(appSource.includes('ReportingStudioView'), 'frontend renders reporting studio view')
-ok(appSource.includes('reportComponentLibrary'), 'financial package editor exposes module library')
-ok(appSource.includes('BlockInspector'), 'financial package editor exposes component inspector')
-ok(appSource.includes('nearestReportWidth'), 'financial package editor supports snapped horizontal resizing')
-ok(appSource.includes('composition-pie'), 'financial package editor exposes composition charts')
-ok(appSource.includes('variance-waterfall'), 'financial package editor exposes variance waterfall charts')
-ok(appSource.includes('account-composition'), 'financial package editor exposes account composition tables')
-ok(appSource.includes('blockReason'), 'financial package editor surfaces blocked or stale package reasons')
+ok(frontendSource.includes('ReportingStudioView'), 'frontend renders reporting studio view')
+ok(frontendSource.includes('reportComponentLibrary'), 'financial package editor exposes module library')
+ok(frontendSource.includes('BlockInspector'), 'financial package editor exposes component inspector')
+ok(frontendSource.includes('nearestReportWidth'), 'financial package editor supports snapped horizontal resizing')
+ok(frontendSource.includes('composition-pie'), 'financial package editor exposes composition charts')
+ok(frontendSource.includes('variance-waterfall'), 'financial package editor exposes variance waterfall charts')
+ok(frontendSource.includes('account-composition'), 'financial package editor exposes account composition tables')
+ok(frontendSource.includes('blockReason'), 'financial package editor surfaces blocked or stale package reasons')
 
 console.log(`Frontend smoke passed (${checks.length} checks).`)

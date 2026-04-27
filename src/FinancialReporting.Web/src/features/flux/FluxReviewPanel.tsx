@@ -159,6 +159,8 @@ type FluxReviewGroup = {
   evidenceJson: string
 }
 
+type FluxType = 'MonthOverMonth' | 'YearOverYear' | 'YearToDate' | 'PriorQuarter' | 'VsBudget'
+
 /** TODO-DEDUPE: matches FluxReviewDrilldown in App.tsx */
 type FluxReviewDrilldown = {
   groupId: string
@@ -191,6 +193,7 @@ type FluxReviewAccount = {
 
 /** TODO-DEDUPE: matches FluxLedgerTransaction in App.tsx */
 type FluxLedgerTransaction = {
+  journalLineId: string
   date: string
   journalNumber: number
   sourceType: string
@@ -281,7 +284,7 @@ function TransactionTable({ title, rows }: { title: string; rows: FluxLedgerTran
                 const sourceId = (row as { sourceId?: string }).sourceId ?? ''
                 const xeroUrl = sourceId ? `https://go.xero.com/Reports/JournalReport.aspx?journalNumber=${row.journalNumber}` : ''
                 return (
-                  <tr key={`${row.journalNumber}-${index}`}>
+                  <tr key={row.journalLineId || `${row.journalNumber}-${index}`}>
                     <td>{row.date}</td>
                     <td>{row.journalNumber}</td>
                     <td>{row.description || row.reference}</td>
@@ -327,7 +330,8 @@ export function FluxReviewPanel({
   const [busy, setBusy] = useState(false)
   const [editing, setEditing] = useState<string | null>(null)
   const [explanation, setExplanation] = useState('')
-  const [fluxType, setFluxType] = useState<'MonthOverMonth' | 'YearOverYear'>('MonthOverMonth')
+  const [fluxType, setFluxType] = useState<FluxType>('MonthOverMonth')
+  const [nowMs] = useState(() => Date.now())
   const [statementType, setStatementType] = useState<'ProfitAndLoss' | 'BalanceSheet'>('ProfitAndLoss')
   const [selectedGroupId, setSelectedGroupId] = useState('')
   const [drilldown, setDrilldown] = useState<FluxReviewDrilldown | null>(null)
@@ -496,7 +500,7 @@ export function FluxReviewPanel({
       group.assignee.toLowerCase().includes(normalizedSearch) ||
       group.reviewer.toLowerCase().includes(normalizedSearch) ||
       group.tags.toLowerCase().includes(normalizedSearch)
-    const isLate = !!group.dueDate && new Date(`${group.dueDate}T23:59:59`).getTime() < Date.now() && group.status !== 'Approved'
+    const isLate = !!group.dueDate && new Date(`${group.dueDate}T23:59:59`).getTime() < nowMs && group.status !== 'Approved'
     const matchesStatus =
       statusFilter === 'all' ||
       (statusFilter === 'required' && group.requiresExplanation) ||
@@ -541,7 +545,7 @@ export function FluxReviewPanel({
       applyScope: 'period',
       explanationTemplate: selectedGroup.explanationTemplate ?? '',
     })
-  }, [selectedGroup?.id])
+  }, [selectedGroup])
 
   return (
     <section className="workbench">
@@ -569,6 +573,9 @@ export function FluxReviewPanel({
       <div className="segmented compact">
         <SegmentButton active={fluxType === 'MonthOverMonth'} onClick={() => setFluxType('MonthOverMonth')}>Current month vs prior month</SegmentButton>
         <SegmentButton active={fluxType === 'YearOverYear'} onClick={() => setFluxType('YearOverYear')}>Current year vs prior year</SegmentButton>
+        <SegmentButton active={fluxType === 'YearToDate'} onClick={() => setFluxType('YearToDate')}>YTD vs prior YTD</SegmentButton>
+        <SegmentButton active={fluxType === 'PriorQuarter'} onClick={() => setFluxType('PriorQuarter')}>Current month vs prior quarter</SegmentButton>
+        <SegmentButton active={fluxType === 'VsBudget'} onClick={() => setFluxType('VsBudget')}>Current vs budget</SegmentButton>
       </div>
       <div className="segmented compact">
         <SegmentButton active={statementType === 'ProfitAndLoss'} onClick={() => setStatementType('ProfitAndLoss')}>P&amp;L flux</SegmentButton>

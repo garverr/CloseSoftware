@@ -27,7 +27,7 @@ function buildHeaders(extra?: Record<string, string>): HeadersInit {
 }
 
 async function parseError(path: string, method: string, response: Response): Promise<never> {
-  let body: unknown = undefined
+  let body: unknown
   try {
     body = await response.json()
   } catch {

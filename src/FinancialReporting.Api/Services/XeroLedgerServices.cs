@@ -5,6 +5,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using FinancialReporting.Api;
 using FinancialReporting.Api.Data;
 using FinancialReporting.Api.Domain;
 using Microsoft.AspNetCore.DataProtection;
@@ -18,6 +19,7 @@ public sealed class XeroTenantLedgerService(
     IHttpClientFactory httpClientFactory,
     IDataProtectionProvider dataProtectionProvider,
     XeroTokenRefreshLock refreshLock,
+    IOrganizationContext organizationContext,
     ILogger<XeroTenantLedgerService> logger)
 {
     private const string LedgerScope = "accounting.journals.read";
@@ -164,8 +166,19 @@ public sealed class XeroTenantLedgerService(
     public async Task<XeroLedgerSyncStatus> GetSyncStatusAsync(AppDbContext db, CancellationToken cancellationToken)
     {
         var setting = await GetSettingsAsync(db, cancellationToken);
-        var tenants = await db.XeroTenantConnections.AsNoTracking().OrderBy(x => x.TenantName).ToListAsync(cancellationToken);
-        var cursors = await db.XeroLedgerSyncCursors.AsNoTracking().ToDictionaryAsync(x => x.TenantId, cancellationToken);
+        var tenantsQuery = db.XeroTenantConnections.AsNoTracking().AsQueryable();
+        var visibleTenantIds = await VisibleTenantIdsAsync(db, cancellationToken);
+        if (visibleTenantIds is not null)
+        {
+            tenantsQuery = tenantsQuery.Where(x => visibleTenantIds.Contains(x.TenantId));
+        }
+
+        var tenants = await tenantsQuery.OrderBy(x => x.TenantName).ToListAsync(cancellationToken);
+        var tenantIds = tenants.Select(x => x.TenantId).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var cursors = await db.XeroLedgerSyncCursors
+            .AsNoTracking()
+            .Where(x => tenantIds.Contains(x.TenantId))
+            .ToDictionaryAsync(x => x.TenantId, cancellationToken);
         return new XeroLedgerSyncStatus(
             setting.Enabled,
             setting.SyncEveryMinutes,
@@ -186,9 +199,34 @@ public sealed class XeroTenantLedgerService(
             }).ToArray());
     }
 
+    private async Task<HashSet<string>?> VisibleTenantIdsAsync(AppDbContext db, CancellationToken cancellationToken)
+    {
+        if (organizationContext.CurrentOrganizationId is null && organizationContext.AllowedTenantIds is null)
+        {
+            return null;
+        }
+
+        var tenantIds = await db.XeroTenantEntityMappings
+            .AsNoTracking()
+            .Where(x => !x.IsIgnored)
+            .Select(x => x.TenantId)
+            .ToListAsync(cancellationToken);
+        var visible = tenantIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (organizationContext.AllowedTenantIds is { } allowed)
+        {
+            visible.IntersectWith(allowed);
+        }
+        return visible;
+    }
+
     public async Task<XeroLedgerSyncResult> RunIncrementalLedgerSyncAsync(AppDbContext db, string? tenantId, bool force, CancellationToken cancellationToken)
     {
         var query = db.XeroTenantConnections.AsQueryable();
+        var visibleTenantIds = await VisibleTenantIdsAsync(db, cancellationToken);
+        if (visibleTenantIds is not null)
+        {
+            query = query.Where(x => visibleTenantIds.Contains(x.TenantId));
+        }
         if (!string.IsNullOrWhiteSpace(tenantId))
         {
             query = query.Where(x => x.TenantId == tenantId);
@@ -1170,7 +1208,7 @@ public sealed class FluxReviewService(AppDbContext db, XeroTenantLedgerService? 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     // P2.20 — per-call cache of the materiality matrix; populated at the start of
     // RefreshAsync / RebuildAsync, consulted by UpsertFluxGroup. Cat 10.
-    private Dictionary<(Guid OrgId, string StatementType), OrgFluxThresholdConfig> _thresholdMatrix = new();
+    private Dictionary<(Guid OrgId, string StatementType, string AccountClass), OrgFluxThresholdConfig> _thresholdMatrix = new();
     private const string MonthOverMonth = "MonthOverMonth";
     private const string YearOverYear = "YearOverYear";
     // P2.19 — additional comparison bases. Cat 9.
@@ -1186,23 +1224,40 @@ public sealed class FluxReviewService(AppDbContext db, XeroTenantLedgerService? 
             .AsNoTracking()
             .Where(x => x.OrganizationId == organizationId)
             .ToListAsync(cancellationToken);
-        _thresholdMatrix = rows.ToDictionary(x => (x.OrganizationId, x.StatementType), x => x);
+        _thresholdMatrix = new();
+        foreach (var row in rows)
+        {
+            _thresholdMatrix.TryAdd((row.OrganizationId, NormalizeThresholdKey(row.StatementType), NormalizeThresholdKey(row.AccountClass)), row);
+        }
     }
 
-    private (decimal Dollar, decimal Percent, string Logic) ResolveDefaultThresholds(Guid organizationId, string statementType)
+    private (decimal Dollar, decimal Percent, string Logic) ResolveDefaultThresholds(Guid organizationId, string statementType, string accountClass)
     {
-        if (_thresholdMatrix.TryGetValue((organizationId, statementType), out var exact))
+        var statementKey = NormalizeThresholdKey(statementType);
+        var classKey = NormalizeThresholdKey(accountClass);
+        if (_thresholdMatrix.TryGetValue((organizationId, statementKey, classKey), out var exact))
         {
             return (exact.DollarThreshold, exact.PercentThreshold, exact.ThresholdLogic);
         }
-        if (_thresholdMatrix.TryGetValue((organizationId, "*"), out var wildcard))
+        if (_thresholdMatrix.TryGetValue((organizationId, statementKey, "*"), out var statementWildcard))
         {
-            return (wildcard.DollarThreshold, wildcard.PercentThreshold, wildcard.ThresholdLogic);
+            return (statementWildcard.DollarThreshold, statementWildcard.PercentThreshold, statementWildcard.ThresholdLogic);
+        }
+        if (_thresholdMatrix.TryGetValue((organizationId, "*", classKey), out var classWildcard))
+        {
+            return (classWildcard.DollarThreshold, classWildcard.PercentThreshold, classWildcard.ThresholdLogic);
+        }
+        if (_thresholdMatrix.TryGetValue((organizationId, "*", "*"), out var globalWildcard))
+        {
+            return (globalWildcard.DollarThreshold, globalWildcard.PercentThreshold, globalWildcard.ThresholdLogic);
         }
         // Best-in-class fallback: $5k AND 10%. Closes the long-standing default-of-zero bug
         // that effectively disabled the dollar leg of the dual-threshold gate.
         return (5_000m, 10m, "AND");
     }
+
+    private static string NormalizeThresholdKey(string value)
+        => string.IsNullOrWhiteSpace(value) ? "*" : value.Trim().ToUpperInvariant();
 
     /// <summary>P2.19 — derive a budget amount per StatementType|GroupKey for the period
     /// from the org's base ForecastScenario. The forecast model expresses growth percentages
@@ -1778,7 +1833,7 @@ public sealed class FluxReviewService(AppDbContext db, XeroTenantLedgerService? 
             instructions = new[]
             {
                 "Explain the variance in plain financial-review language using ONLY the data in this JSON snapshot.",
-                "Cite specific journalLineIds for every claim — every evidence[] entry MUST include the journalLineId field copied verbatim from drilldown.currentTransactions or drilldown.priorTransactions.",
+                "Cite specific journalLineIds for every claim — every evidence[] entry MUST include a journalLineId copied verbatim from drilldown.accounts[].currentTransactions[] or drilldown.accounts[].priorTransactions[].",
                 "Use the supplied vendorContext labels and cadenceLabel directly; do not invent vendor classifications.",
                 "If sourceTypeBreakdown shows non-zero MANJOURNAL contribution, treat that portion separately as a manual / reclass adjustment.",
                 "Return a ranked hypotheses[] array, most-likely first, each with rank, label, confidence in [0,1], and journalLineIds[] backing it.",
@@ -1975,7 +2030,7 @@ public sealed class FluxReviewService(AppDbContext db, XeroTenantLedgerService? 
             // and cached on the service via _thresholdMatrix). Falls back to the new
             // best-in-class defaults of $5k AND 10% — the prior 0 / OR effectively disabled
             // the dollar leg of the dual-threshold gate. Cat 10.
-            var (defaultDollar, defaultPercent, defaultLogic) = ResolveDefaultThresholds(package.OrganizationId, group.StatementType);
+            var (defaultDollar, defaultPercent, defaultLogic) = ResolveDefaultThresholds(package.OrganizationId, group.StatementType, InferAccountClass(group));
             reviewGroup = new FluxReviewGroup
             {
                 Id = Guid.NewGuid(),
@@ -2365,6 +2420,7 @@ public sealed class FluxReviewService(AppDbContext db, XeroTenantLedgerService? 
             .ThenByDescending(x => x.journal.JournalNumber)
             .Take(150)
             .Select(x => new FluxLedgerTransactionDto(
+                x.line.SourceLineId,
                 x.journal.JournalDate,
                 x.journal.JournalNumber,
                 x.journal.SourceType,
@@ -2434,6 +2490,40 @@ public sealed class FluxReviewService(AppDbContext db, XeroTenantLedgerService? 
         return string.Equals(group.ThresholdLogic, "AND", StringComparison.OrdinalIgnoreCase)
             ? percentHit && (group.DollarThreshold <= 0m || dollarHit)
             : percentHit || dollarHit;
+    }
+
+    private static string InferAccountClass(StatementGroup group)
+    {
+        var text = $"{group.StatementType} {group.GroupKey} {group.GroupName} {string.Join(' ', group.Lines.Select(x => x.Section))}";
+        if (text.Contains("revenue", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("sales", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("income", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Revenue";
+        }
+        if (text.Contains("expense", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("opex", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("payroll", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("cost", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Operating Expense";
+        }
+        if (text.Contains("asset", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("cash", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("receivable", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Asset";
+        }
+        if (text.Contains("liabil", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("payable", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Liability";
+        }
+        if (text.Contains("equity", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Equity";
+        }
+        return "*";
     }
 
     private static string PeriodKey(DateOnly date) => date.ToString("yyyy-MM", CultureInfo.InvariantCulture);
@@ -2922,6 +3012,7 @@ public sealed record FluxReviewAccountDto(
     IReadOnlyList<FluxLedgerTransactionDto> PriorTransactions);
 
 public sealed record FluxLedgerTransactionDto(
+    string JournalLineId,
     DateOnly Date,
     int JournalNumber,
     string SourceType,

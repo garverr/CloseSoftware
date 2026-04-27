@@ -1,4 +1,5 @@
 using System.Text.Json;
+using FinancialReporting.Api;
 using FinancialReporting.Api.Common;
 using FinancialReporting.Api.Data;
 using FinancialReporting.Api.Domain;
@@ -20,10 +21,10 @@ public static class XeroEndpoints
     public static IEndpointRouteBuilder MapXeroEndpoints(this IEndpointRouteBuilder app)
     {
         // ── Status ───────────────────────────────────────────────────────────────────────
-        app.MapGet("/api/xero/status", async (AppDbContext db, XeroIntegrationService xero, XeroTenantLedgerService ledger, CancellationToken ct) =>
+        app.MapGet("/api/xero/status", async (AppDbContext db, IOrganizationContext orgContext, XeroIntegrationService xero, XeroTenantLedgerService ledger, CancellationToken ct) =>
         {
             var connections = await db.XeroConnections.AsNoTracking().OrderBy(x => x.TenantName).ToListAsync(ct);
-            var tenants = await db.XeroTenantConnections.AsNoTracking().OrderBy(x => x.TenantName).ToListAsync(ct);
+            var tenants = await VisibleTenantsAsync(db, orgContext, ct);
             var mappings = await db.XeroTenantEntityMappings.AsNoTracking().ToListAsync(ct);
             var runs = (await db.XeroSyncRuns.AsNoTracking().ToListAsync(ct))
                 .OrderByDescending(x => x.StartedAt)
@@ -41,9 +42,9 @@ public static class XeroEndpoints
         });
 
         // ── Tenants ──────────────────────────────────────────────────────────────────────
-        app.MapGet("/api/xero/tenants", async (AppDbContext db, CancellationToken ct) =>
+        app.MapGet("/api/xero/tenants", async (AppDbContext db, IOrganizationContext orgContext, CancellationToken ct) =>
         {
-            var tenants = await db.XeroTenantConnections.AsNoTracking().OrderBy(x => x.TenantName).ToListAsync(ct);
+            var tenants = await VisibleTenantsAsync(db, orgContext, ct);
             var mappings = await db.XeroTenantEntityMappings.AsNoTracking().ToDictionaryAsync(x => x.TenantId, ct);
             return Results.Ok(tenants.Select(t =>
             {
@@ -71,6 +72,7 @@ public static class XeroEndpoints
             TenantEntityMapRequest request,
             HttpContext http,
             AppDbContext db,
+            IOrganizationContext orgContext,
             CancellationToken ct) =>
         {
             if (!EndpointHelpers.Can(http, "Admin"))
@@ -80,6 +82,10 @@ public static class XeroEndpoints
 
             var tenant = await db.XeroTenantConnections.FirstOrDefaultAsync(x => x.TenantId == tenantId, ct);
             if (tenant is null)
+            {
+                return Results.NotFound();
+            }
+            if (!await TenantIsVisibleAsync(db, orgContext, tenantId, ct))
             {
                 return Results.NotFound();
             }
@@ -317,12 +323,17 @@ public static class XeroEndpoints
             XeroLedgerRunRequest request,
             HttpContext http,
             AppDbContext db,
+            IOrganizationContext orgContext,
             XeroTenantLedgerService ledger,
             CancellationToken ct) =>
         {
             if (!EndpointHelpers.Can(http, "Admin", "Finance Editor"))
             {
                 return Results.Forbid();
+            }
+            if (!string.IsNullOrWhiteSpace(request.TenantId) && !await TenantIsVisibleAsync(db, orgContext, request.TenantId, ct))
+            {
+                return Results.NotFound();
             }
 
             var result = await ledger.RunIncrementalLedgerSyncAsync(db, request.TenantId, request.Force, ct);
@@ -421,8 +432,12 @@ public static class XeroEndpoints
         });
 
         // ── Ledger Reconciliations ───────────────────────────────────────────────────────
-        app.MapGet("/api/xero/tenants/{tenantId}/ledger-reconciliations", async (string tenantId, AppDbContext db, XeroTenantLedgerService ledger, CancellationToken ct) =>
+        app.MapGet("/api/xero/tenants/{tenantId}/ledger-reconciliations", async (string tenantId, AppDbContext db, IOrganizationContext orgContext, XeroTenantLedgerService ledger, CancellationToken ct) =>
         {
+            if (!await TenantIsVisibleAsync(db, orgContext, tenantId, ct))
+            {
+                return Results.NotFound();
+            }
             var result = await ledger.GetReconciliationsAsync(db, tenantId, ct);
             return Results.Ok(result);
         });
@@ -432,12 +447,17 @@ public static class XeroEndpoints
             XeroReconciliationRunRequest request,
             HttpContext http,
             AppDbContext db,
+            IOrganizationContext orgContext,
             XeroTenantLedgerService ledger,
             CancellationToken ct) =>
         {
             if (!EndpointHelpers.Can(http, "Admin", "Finance Editor"))
             {
                 return Results.Forbid();
+            }
+            if (!await TenantIsVisibleAsync(db, orgContext, tenantId, ct))
+            {
+                return Results.NotFound();
             }
 
             var date = request.SnapshotDate ?? DateOnly.FromDateTime(DateTime.UtcNow.Date);
@@ -448,10 +468,15 @@ public static class XeroEndpoints
         });
 
         // ── Test Probe ───────────────────────────────────────────────────────────────────
-        app.MapPost("/api/xero/test", async (AppDbContext db, XeroIntegrationService xero, XeroTenantLedgerService ledger, CancellationToken ct) =>
+        app.MapPost("/api/xero/test", async (HttpContext http, AppDbContext db, IOrganizationContext orgContext, XeroIntegrationService xero, XeroTenantLedgerService ledger, CancellationToken ct) =>
         {
+            if (!EndpointHelpers.Can(http, "Admin"))
+            {
+                return Results.Forbid();
+            }
+
             var connections = await db.XeroConnections.AsNoTracking().ToListAsync(ct);
-            var tenants = await db.XeroTenantConnections.AsNoTracking().ToListAsync(ct);
+            var tenants = await VisibleTenantsAsync(db, orgContext, ct);
             var mappings = await db.XeroTenantEntityMappings.AsNoTracking().ToListAsync(ct);
             var runs = (await db.XeroSyncRuns.AsNoTracking().ToListAsync(ct))
                 .OrderByDescending(x => x.StartedAt)
@@ -465,6 +490,33 @@ public static class XeroEndpoints
     }
 
     // ── Private helpers ──────────────────────────────────────────────────────────────────
+
+    private static async Task<bool> TenantIsVisibleAsync(AppDbContext db, IOrganizationContext orgContext, string tenantId, CancellationToken ct)
+    {
+        var visible = await VisibleTenantsAsync(db, orgContext, ct);
+        return visible.Any(x => string.Equals(x.TenantId, tenantId, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static async Task<List<XeroTenantConnection>> VisibleTenantsAsync(AppDbContext db, IOrganizationContext orgContext, CancellationToken ct)
+    {
+        var query = db.XeroTenantConnections.AsNoTracking().AsQueryable();
+        if (orgContext.CurrentOrganizationId is not null || orgContext.AllowedTenantIds is not null)
+        {
+            var tenantIds = await db.XeroTenantEntityMappings
+                .AsNoTracking()
+                .Where(x => !x.IsIgnored)
+                .Select(x => x.TenantId)
+                .ToListAsync(ct);
+            var visible = tenantIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
+            if (orgContext.AllowedTenantIds is { } allowed)
+            {
+                visible.IntersectWith(allowed);
+            }
+            query = query.Where(x => visible.Contains(x.TenantId));
+        }
+
+        return await query.OrderBy(x => x.TenantName).ToListAsync(ct);
+    }
 
     // Local copy of Program.cs helper; will dedupe once Program.cs is fully drained.
     private static string XeroCallbackHtml(bool success, string title, string message)

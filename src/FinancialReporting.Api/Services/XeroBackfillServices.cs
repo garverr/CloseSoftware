@@ -5,6 +5,7 @@ using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using FinancialReporting.Api;
 using FinancialReporting.Api.Data;
 using FinancialReporting.Api.Domain;
 using Microsoft.AspNetCore.DataProtection;
@@ -230,6 +231,7 @@ public sealed class XeroBackfillService(
     XeroTenantLedgerService ledgerService,
     XeroApiRequestScheduler scheduler,
     XeroTokenRefreshLock refreshLock,
+    IOrganizationContext organizationContext,
     ILogger<XeroBackfillService> logger)
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
@@ -1198,6 +1200,11 @@ public sealed class XeroBackfillService(
             .AsNoTracking()
             .Where(x => x.ConnectionStatus == "Connected")
             .ToListAsync(cancellationToken);
+        if (organizationContext.AllowedTenantIds is { } allowedTenantIds)
+        {
+            var allowed = allowedTenantIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
+            tenants = tenants.Where(x => allowed.Contains(x.TenantId)).ToList();
+        }
         var mappingRows = await db.XeroTenantEntityMappings
             .AsNoTracking()
             .Where(x => !x.IsIgnored)

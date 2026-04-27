@@ -35,6 +35,10 @@ public static class IssueEndpoints
             {
                 return Results.Forbid();
             }
+            if (await EndpointHelpers.RejectIfPackageApprovedAsync(db, packageId, ct) is { } locked)
+            {
+                return locked;
+            }
 
             var issue = await db.PackageIssues.FirstOrDefaultAsync(x => x.Id == issueId && x.ReportPackageId == packageId, ct);
             if (issue is null)
@@ -86,6 +90,10 @@ public static class IssueEndpoints
             if (!EndpointHelpers.Can(http, "Admin", "Finance Editor", "Reviewer"))
             {
                 return Results.Forbid();
+            }
+            if (await EndpointHelpers.RejectIfPackageApprovedAsync(db, packageId, ct) is { } locked)
+            {
+                return locked;
             }
 
             var issue = await db.PackageIssues.FirstOrDefaultAsync(x => x.Id == issueId && x.ReportPackageId == packageId, ct);

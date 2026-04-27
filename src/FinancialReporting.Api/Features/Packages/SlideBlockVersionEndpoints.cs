@@ -51,6 +51,10 @@ public static class SlideBlockVersionEndpoints
             {
                 return Results.NotFound();
             }
+            if (await EndpointHelpers.RejectIfPackageApprovedAsync(db, packageId, ct) is { } locked)
+            {
+                return locked;
+            }
 
             var before = await snapshotBuilder.BuildPackageSnapshotAsync(packageId, ct);
             var restored = await RestorePackageSnapshotAsync(db, packageId, version.SnapshotJson, ct);
@@ -93,6 +97,14 @@ public static class SlideBlockVersionEndpoints
             {
                 return Results.NotFound();
             }
+            if (slide.ReportPackage is null)
+            {
+                return Results.NotFound();
+            }
+            if (EndpointHelpers.RejectIfApproved(slide.ReportPackage) is { } locked)
+            {
+                return locked;
+            }
 
             var before = await snapshotBuilder.BuildPackageSnapshotAsync(slide.ReportPackageId, ct);
             slide.Subject = request.Subject ?? slide.Subject;
@@ -127,10 +139,21 @@ public static class SlideBlockVersionEndpoints
                 return Results.Forbid();
             }
 
-            var slide = await db.PackageSlides.Include(x => x.Blocks).FirstOrDefaultAsync(x => x.Id == slideId, ct);
+            var slide = await db.PackageSlides
+                .Include(x => x.ReportPackage)
+                .Include(x => x.Blocks)
+                .FirstOrDefaultAsync(x => x.Id == slideId, ct);
             if (slide is null)
             {
                 return Results.NotFound();
+            }
+            if (slide.ReportPackage is null)
+            {
+                return Results.NotFound();
+            }
+            if (EndpointHelpers.RejectIfApproved(slide.ReportPackage) is { } locked)
+            {
+                return locked;
             }
 
             var before = await snapshotBuilder.BuildPackageSnapshotAsync(slide.ReportPackageId, ct);
@@ -162,10 +185,21 @@ public static class SlideBlockVersionEndpoints
                 return Results.Forbid();
             }
 
-            var block = await db.SlideBlocks.Include(x => x.PackageSlide).FirstOrDefaultAsync(x => x.Id == blockId, ct);
+            var block = await db.SlideBlocks
+                .Include(x => x.PackageSlide)
+                    .ThenInclude(x => x!.ReportPackage)
+                .FirstOrDefaultAsync(x => x.Id == blockId, ct);
             if (block is null)
             {
                 return Results.NotFound();
+            }
+            if (block.PackageSlide?.ReportPackage is null)
+            {
+                return Results.NotFound();
+            }
+            if (EndpointHelpers.RejectIfApproved(block.PackageSlide.ReportPackage) is { } locked)
+            {
+                return locked;
             }
 
             var before = await snapshotBuilder.BuildPackageSnapshotAsync(block.PackageSlide!.ReportPackageId, ct);
@@ -189,10 +223,21 @@ public static class SlideBlockVersionEndpoints
                 return Results.Forbid();
             }
 
-            var block = await db.SlideBlocks.Include(x => x.PackageSlide).FirstOrDefaultAsync(x => x.Id == blockId, ct);
+            var block = await db.SlideBlocks
+                .Include(x => x.PackageSlide)
+                    .ThenInclude(x => x!.ReportPackage)
+                .FirstOrDefaultAsync(x => x.Id == blockId, ct);
             if (block is null)
             {
                 return Results.NotFound();
+            }
+            if (block.PackageSlide?.ReportPackage is null)
+            {
+                return Results.NotFound();
+            }
+            if (EndpointHelpers.RejectIfApproved(block.PackageSlide.ReportPackage) is { } locked)
+            {
+                return locked;
             }
 
             var packageId = block.PackageSlide!.ReportPackageId;
@@ -216,10 +261,21 @@ public static class SlideBlockVersionEndpoints
                 return Results.Forbid();
             }
 
-            var slide = await db.PackageSlides.Include(x => x.Blocks).FirstOrDefaultAsync(x => x.Id == slideId, ct);
+            var slide = await db.PackageSlides
+                .Include(x => x.ReportPackage)
+                .Include(x => x.Blocks)
+                .FirstOrDefaultAsync(x => x.Id == slideId, ct);
             if (slide is null)
             {
                 return Results.NotFound();
+            }
+            if (slide.ReportPackage is null)
+            {
+                return Results.NotFound();
+            }
+            if (EndpointHelpers.RejectIfApproved(slide.ReportPackage) is { } locked)
+            {
+                return locked;
             }
 
             var before = await snapshotBuilder.BuildPackageSnapshotAsync(slide.ReportPackageId, ct);

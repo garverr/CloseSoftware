@@ -31,8 +31,9 @@ public sealed class NullOrganizationContext : IOrganizationContext
 
 /// <summary>
 /// Reads the active organization from the authenticated JWT principal's `org` claim and
-/// allowed tenant ids from `xero_tenants` (space-separated). Falls back to null when no
-/// claim is present, which preserves the dev bypass behavior.
+/// allowed tenant ids from `xero_tenants` (space-separated). Development header bypasses
+/// still return null so local data is unfiltered. Authenticated callers without org scope
+/// fail closed by returning Guid.Empty unless they carry an explicit PlatformAdmin role.
 /// </summary>
 public sealed class HttpContextOrganizationContext(IHttpContextAccessor accessor) : IOrganizationContext
 {
@@ -45,8 +46,12 @@ public sealed class HttpContextOrganizationContext(IHttpContextAccessor accessor
             {
                 return null;
             }
+            if (IsPlatformAdmin(user))
+            {
+                return null;
+            }
             var raw = user.FindFirst("org")?.Value;
-            return Guid.TryParse(raw, out var id) ? id : null;
+            return Guid.TryParse(raw, out var id) ? id : Guid.Empty;
         }
     }
 
@@ -59,14 +64,22 @@ public sealed class HttpContextOrganizationContext(IHttpContextAccessor accessor
             {
                 return null;
             }
+            if (IsPlatformAdmin(user))
+            {
+                return null;
+            }
             var raw = user.FindFirst("xero_tenants")?.Value;
             if (string.IsNullOrWhiteSpace(raw))
             {
-                return null;
+                return [];
             }
             return raw.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         }
     }
+
+    private static bool IsPlatformAdmin(ClaimsPrincipal user)
+        => user.FindAll(ClaimTypes.Role).Any(x => string.Equals(x.Value, "PlatformAdmin", StringComparison.OrdinalIgnoreCase))
+           || user.FindAll("role").Any(x => string.Equals(x.Value, "PlatformAdmin", StringComparison.OrdinalIgnoreCase));
 }
 
 /// <summary>Captured at startup so endpoints/services can issue dev tokens.</summary>

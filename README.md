@@ -26,7 +26,7 @@ See `docs/superpowers/specs/2026-04-27-best-in-class-review/99-rollup.md` for th
 
 ```bash
 # 1. Start the API
-dotnet run --project src/FinancialReporting.Api --urls http://localhost:5198
+dotnet run --project src/FinancialReporting.Api --urls http://localhost:5264
 
 # 2. Start the frontend
 cd src/FinancialReporting.Web
@@ -108,8 +108,8 @@ No manual seed step is required.
 ## Auth
 
 - **Development**: header-based bypass (`X-FR-Role: Admin`, `X-FR-User: …`) is active. Missing headers default to Admin / dev-admin.
-- **Non-Development**: missing headers produce `401`. The bypass is gated on `app.Environment.IsDevelopment()` (P0.1).
-- A real OIDC / JWT layer is the next planned auth task. The endpoint helpers + EF global query filters (P3.30) are already plumbed to read from an `IOrganizationContext` claim once it lands.
+- **Non-Development**: `/api/*` requires bearer JWT auth except `/api/health` and `/api/xero/callback`. `X-FR-*` headers are ignored outside Development.
+- Authenticated users without an `org` claim fail closed; `PlatformAdmin` is the explicit unscoped role. Xero tenant metadata is further limited by `xero_tenants` claims when present.
 
 ## Backups + DR
 
@@ -123,7 +123,7 @@ No manual seed step is required.
 dotnet test
 ```
 
-The numeric regression suite covers variance edge cases (sign flips, zero-prior, both-zero), dual-threshold AND vs OR logic, materiality defaults, the baseline diff engine across all four decision kinds, and the YearToDate flux path. The CodeWorkflow tests cover Xero OAuth callback, period sync, journal pagination, ledger retention, runtime mock cleanup, AI draft staging, and the V2 import.
+The numeric regression suite covers variance edge cases (sign flips, zero-prior, both-zero), dual-threshold AND vs OR logic, materiality defaults, the baseline diff engine across all four decision kinds, and the YearToDate flux path. The workflow tests cover auth/org fail-closed behavior, AI citation validation, Xero OAuth callback, period sync, ledger journal upsert behavior, ledger retention, runtime mock cleanup, AI draft staging, and the V2 import.
 
 ## Layout
 

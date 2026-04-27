@@ -21,9 +21,15 @@ public static class PackageLifecycleEndpoints
         // POST /api/packages — create a new report package shell.
         app.MapPost("/api/packages", async (
             CreatePackageRequest request,
+            HttpContext http,
             AppDbContext db,
             CancellationToken ct) =>
         {
+            if (!EndpointHelpers.Can(http, "Admin", "Finance Editor"))
+            {
+                return Results.Forbid();
+            }
+
             var org = await db.Organizations.FirstOrDefaultAsync(x => x.Key == request.OrganizationKey, ct);
             var period = await db.ReportingPeriods.FirstOrDefaultAsync(x => x.Key == request.PeriodKey, ct);
             if (org is null || period is null)
@@ -130,6 +136,10 @@ public static class PackageLifecycleEndpoints
             {
                 return Results.NotFound();
             }
+            if (EndpointHelpers.RejectIfApproved(package) is { } locked)
+            {
+                return locked;
+            }
 
             package.Status = PackageStatus.Syncing;
             await db.SaveChangesAsync(ct);
@@ -211,6 +221,10 @@ public static class PackageLifecycleEndpoints
             if (package is null || template is null)
             {
                 return Results.NotFound();
+            }
+            if (EndpointHelpers.RejectIfApproved(package) is { } locked)
+            {
+                return locked;
             }
 
             var before = await snapshotBuilder.BuildPackageSnapshotAsync(packageId, ct);

@@ -1,8 +1,13 @@
+using System.Reflection;
+using System.Security.Claims;
 using System.Text.Json;
+using FinancialReporting.Api;
+using FinancialReporting.Api.Common;
 using FinancialReporting.Api.Data;
 using FinancialReporting.Api.Domain;
 using FinancialReporting.Api.Services;
 using Microsoft.AspNetCore.DataProtection;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -13,6 +18,124 @@ namespace FinancialReporting.Api.Tests;
 
 public sealed class CoreWorkflowTests
 {
+    [Fact]
+    public void EndpointHelpers_CanDoesNotTrustRoleHeaderWhenBypassIsDisabled()
+    {
+        var http = new DefaultHttpContext();
+        http.Request.Headers["X-FR-Role"] = "Admin";
+
+        Assert.False(EndpointHelpers.Can(http, "Admin"));
+    }
+
+    [Fact]
+    public void OrganizationContext_AuthenticatedPrincipalWithoutOrgFailsClosed()
+    {
+        var http = new DefaultHttpContext
+        {
+            User = new ClaimsPrincipal(new ClaimsIdentity(
+                [new Claim(ClaimTypes.NameIdentifier, "user-1")],
+                authenticationType: "Test"))
+        };
+        var context = new HttpContextOrganizationContext(new HttpContextAccessor { HttpContext = http });
+
+        Assert.Equal(Guid.Empty, context.CurrentOrganizationId);
+        var tenantIds = Assert.IsAssignableFrom<IReadOnlyCollection<string>>(context.AllowedTenantIds);
+        Assert.Empty(tenantIds);
+    }
+
+    [Fact]
+    public void OrganizationContext_PlatformAdminCanUseUnscopedAdministrativeQueries()
+    {
+        var http = new DefaultHttpContext
+        {
+            User = new ClaimsPrincipal(new ClaimsIdentity(
+                [new Claim(ClaimTypes.Role, "PlatformAdmin")],
+                authenticationType: "Test"))
+        };
+        var context = new HttpContextOrganizationContext(new HttpContextAccessor { HttpContext = http });
+
+        Assert.Null(context.CurrentOrganizationId);
+        Assert.Null(context.AllowedTenantIds);
+    }
+
+    [Fact]
+    public void FluxExplainValidation_RequiresMachineReadableJournalCitations()
+    {
+        var output = """
+            {
+              "summary": "Revenue moved on one invoice.",
+              "suggestedExplanation": "Revenue increased due to a cited invoice.",
+              "confidence": 0.91,
+              "operations": [{ "op": "set_flux_explanation", "targetId": "group-1" }],
+              "hypotheses": [{ "rank": 1, "label": "Invoice timing", "confidence": 0.91, "journalLineIds": ["line-1"] }],
+              "evidence": [{ "journalLineId": "line-1", "amount": 1000 }]
+            }
+            """;
+
+        var result = ValidateAiJson(output, "flux-explain");
+
+        Assert.True(result.Valid, result.Error);
+    }
+
+    [Fact]
+    public void FluxExplainValidation_RejectsEvidenceWithoutJournalLineId()
+    {
+        var output = """
+            {
+              "summary": "Revenue moved on one invoice.",
+              "suggestedExplanation": "Revenue increased due to an invoice.",
+              "confidence": 0.91,
+              "operations": [{ "op": "set_flux_explanation", "targetId": "group-1" }],
+              "hypotheses": [{ "rank": 1, "label": "Invoice timing", "confidence": 0.91, "journalLineIds": ["line-1"] }],
+              "evidence": [{ "amount": 1000 }]
+            }
+            """;
+
+        var result = ValidateAiJson(output, "flux-explain");
+
+        Assert.False(result.Valid);
+        Assert.Equal("every evidence[] element must include a journalLineId from the supplied snapshot", result.Error);
+    }
+
+    [Fact]
+    public void FluxExplainValidation_RejectsCitationsOutsideTheSnapshot()
+    {
+        var output = """
+            {
+              "summary": "Revenue moved on one invoice.",
+              "suggestedExplanation": "Revenue increased due to an uncited invoice.",
+              "confidence": 0.91,
+              "operations": [{ "op": "set_flux_explanation", "targetId": "group-1" }],
+              "hypotheses": [{ "rank": 1, "label": "Invoice timing", "confidence": 0.91, "journalLineIds": ["foreign-line"] }],
+              "evidence": [{ "journalLineId": "foreign-line", "amount": 1000 }]
+            }
+            """;
+
+        var result = ValidateAiJson(output, "flux-explain");
+
+        Assert.False(result.Valid);
+        Assert.Equal("each hypothesis must cite at least one journalLineId from the supplied snapshot", result.Error);
+    }
+
+    private static (bool Valid, string Error) ValidateAiJson(string output, string module)
+    {
+        var method = typeof(CodexWorker).GetMethod("TryValidateAiJson", BindingFlags.NonPublic | BindingFlags.Static)
+                     ?? throw new MissingMethodException(nameof(CodexWorker), "TryValidateAiJson");
+        const string inputJson = """
+            {
+              "drilldown": {
+                "accounts": [{
+                  "currentTransactions": [{ "journalLineId": "line-1" }],
+                  "priorTransactions": []
+                }]
+              }
+            }
+            """;
+        object?[] args = [output, module, inputJson, ""];
+        var valid = (bool)method.Invoke(null, args)!;
+        return (valid, (string)args[3]!);
+    }
+
     [Fact]
     public void Variance_ReturnsAmountAndRoundedPercent()
     {
@@ -591,6 +714,7 @@ public sealed class CoreWorkflowTests
             new StaticHttpClientFactory(),
             provider.GetRequiredService<IDataProtectionProvider>(),
             new XeroTokenRefreshLock(),
+            new NullOrganizationContext(),
             NullLogger<XeroTenantLedgerService>.Instance);
 
         var preview = await service.PreviewFinanceAppV2ImportAsync(CancellationToken.None);
@@ -953,7 +1077,7 @@ public sealed class CoreWorkflowTests
                 ["Xero:ClientId"] = "client"
             })
             .Build();
-        return new XeroTenantLedgerService(configuration, new StaticHttpClientFactory(), provider, new XeroTokenRefreshLock(), NullLogger<XeroTenantLedgerService>.Instance);
+        return new XeroTenantLedgerService(configuration, new StaticHttpClientFactory(), provider, new XeroTokenRefreshLock(), new NullOrganizationContext(), NullLogger<XeroTenantLedgerService>.Instance);
     }
 
     [Fact]

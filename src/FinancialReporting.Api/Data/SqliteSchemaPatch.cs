@@ -49,12 +49,14 @@ public static class SqliteSchemaPatch
                 "Type" TEXT NOT NULL,
                 "Description" TEXT NOT NULL,
                 "CriteriaJson" TEXT NOT NULL,
+                "Amount" TEXT NOT NULL DEFAULT '0',
                 "Reason" TEXT NOT NULL,
                 "IsActive" INTEGER NOT NULL,
                 "CreatedAt" TEXT NOT NULL,
                 "UpdatedAt" TEXT NOT NULL
             );
             """, cancellationToken);
+        await AddColumnIfMissingAsync(db, "RecurringEliminationRules", "Amount", "TEXT NOT NULL DEFAULT '0'", cancellationToken);
 
         await db.Database.ExecuteSqlRawAsync("""
             CREATE TABLE IF NOT EXISTS "XeroTenantConnections" (

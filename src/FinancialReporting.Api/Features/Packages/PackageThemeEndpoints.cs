@@ -103,6 +103,10 @@ public static class PackageThemeEndpoints
             {
                 return Results.NotFound();
             }
+            if (EndpointHelpers.RejectIfApproved(package) is { } locked)
+            {
+                return locked;
+            }
 
             var before = await snapshotBuilder.BuildPackageSnapshotAsync(packageId, ct);
             var settings = NormalizeReportingStudioSettings(request);
@@ -135,6 +139,10 @@ public static class PackageThemeEndpoints
             if (package is null)
             {
                 return Results.NotFound();
+            }
+            if (EndpointHelpers.RejectIfApproved(package) is { } locked)
+            {
+                return locked;
             }
 
             var before = await snapshotBuilder.BuildPackageSnapshotAsync(packageId, ct);
@@ -187,6 +195,10 @@ public static class PackageThemeEndpoints
             if (package is null)
             {
                 return Results.NotFound();
+            }
+            if (EndpointHelpers.RejectIfApproved(package) is { } locked)
+            {
+                return locked;
             }
 
             var before = await snapshotBuilder.BuildPackageSnapshotAsync(packageId, ct);

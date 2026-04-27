@@ -854,7 +854,7 @@ public sealed class CodexWorker(
 
             await UpdateRunProgressAsync(db, run, 70, "Checking AI response.", cancellationToken);
 
-            if (!TryValidateAiJson(output, run.Module, out var validationError) && !useMock)
+            if (!TryValidateAiJson(output, run.Module, run.InputJson, out var validationError) && !useMock)
             {
                 run.Logs += $"\nCodex returned invalid JSON ({validationError}); retrying once.";
                 await UpdateRunProgressAsync(db, run, 78, "Retrying AI response.", cancellationToken);
@@ -862,7 +862,7 @@ public sealed class CodexWorker(
                 await UpdateRunProgressAsync(db, run, 82, "Checking retry response.", cancellationToken);
             }
 
-            if (!TryValidateAiJson(output, run.Module, out validationError))
+                if (!TryValidateAiJson(output, run.Module, run.InputJson, out validationError))
             {
                 throw new InvalidOperationException($"AI output did not match the required JSON contract: {validationError}");
             }
@@ -1067,7 +1067,7 @@ public sealed class CodexWorker(
            """ + "\n" + snapshotJson;
     }
 
-    private static bool TryValidateAiJson(string output, string module, out string error)
+    private static bool TryValidateAiJson(string output, string module, string inputJson, out string error)
     {
         try
         {
@@ -1086,6 +1086,13 @@ public sealed class CodexWorker(
 
             if (string.Equals(module, "flux-explain", StringComparison.OrdinalIgnoreCase))
             {
+                var allowedJournalLineIds = ExtractJournalLineIds(inputJson);
+                if (allowedJournalLineIds.Count == 0)
+                {
+                    error = "snapshot must include at least one journalLineId";
+                    return false;
+                }
+
                 if (!document.RootElement.TryGetProperty("suggestedExplanation", out var explanation) || explanation.ValueKind != JsonValueKind.String)
                 {
                     error = "suggestedExplanation string is required";
@@ -1117,20 +1124,42 @@ public sealed class CodexWorker(
                         error = "each hypothesis must have rank, label, confidence";
                         return false;
                     }
+                    if (!h.TryGetProperty("journalLineIds", out var hypothesisLineIds)
+                        || hypothesisLineIds.ValueKind != JsonValueKind.Array
+                        || !hypothesisLineIds.EnumerateArray().Any(lineId => lineId.ValueKind == JsonValueKind.String && allowedJournalLineIds.Contains(lineId.GetString() ?? "")))
+                    {
+                        error = "each hypothesis must cite at least one journalLineId from the supplied snapshot";
+                        return false;
+                    }
                 }
 
                 // P2.23 — every evidence[] element must carry a machine-parseable
                 // journalLineId so the AI's citations can be verified back to source rows.
-                if (document.RootElement.TryGetProperty("evidence", out var evidence) && evidence.ValueKind == JsonValueKind.Array)
+                if (!document.RootElement.TryGetProperty("evidence", out var evidence) || evidence.ValueKind != JsonValueKind.Array || evidence.GetArrayLength() == 0)
                 {
-                    foreach (var e in evidence.EnumerateArray())
+                    error = "non-empty evidence array is required";
+                    return false;
+                }
+                foreach (var e in evidence.EnumerateArray())
+                {
+                    if (!e.TryGetProperty("journalLineId", out var lineId) || lineId.ValueKind != JsonValueKind.String || !allowedJournalLineIds.Contains(lineId.GetString() ?? ""))
                     {
-                        if (!e.TryGetProperty("journalLineId", out var lineId) || lineId.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(lineId.GetString()))
-                        {
-                            error = "every evidence[] element must include a non-empty journalLineId";
-                            return false;
-                        }
+                        error = "every evidence[] element must include a journalLineId from the supplied snapshot";
+                        return false;
                     }
+                }
+
+                if (!operations.EnumerateArray().Any(operation =>
+                        operation.ValueKind == JsonValueKind.Object
+                        && operation.TryGetProperty("op", out var op)
+                        && op.ValueKind == JsonValueKind.String
+                        && string.Equals(op.GetString(), "set_flux_explanation", StringComparison.Ordinal)
+                        && operation.TryGetProperty("targetId", out var targetId)
+                        && targetId.ValueKind == JsonValueKind.String
+                        && !string.IsNullOrWhiteSpace(targetId.GetString())))
+                {
+                    error = "operations must include set_flux_explanation with a targetId";
+                    return false;
                 }
 
                 error = "";
@@ -1186,6 +1215,46 @@ public sealed class CodexWorker(
         }
     }
 
+    private static HashSet<string> ExtractJournalLineIds(string inputJson)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(inputJson);
+            var ids = new HashSet<string>(StringComparer.Ordinal);
+            CollectJournalLineIds(document.RootElement, ids);
+            return ids;
+        }
+        catch (JsonException)
+        {
+            return [];
+        }
+    }
+
+    private static void CollectJournalLineIds(JsonElement element, HashSet<string> ids)
+    {
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.Object:
+                foreach (var property in element.EnumerateObject())
+                {
+                    if (string.Equals(property.Name, "journalLineId", StringComparison.OrdinalIgnoreCase)
+                        && property.Value.ValueKind == JsonValueKind.String
+                        && !string.IsNullOrWhiteSpace(property.Value.GetString()))
+                    {
+                        ids.Add(property.Value.GetString()!);
+                    }
+                    CollectJournalLineIds(property.Value, ids);
+                }
+                break;
+            case JsonValueKind.Array:
+                foreach (var item in element.EnumerateArray())
+                {
+                    CollectJournalLineIds(item, ids);
+                }
+                break;
+        }
+    }
+
     private static string MockFluxExplanation(string snapshotJson)
     {
         try
@@ -1212,9 +1281,7 @@ public sealed class CodexWorker(
 
             // Pull a journalLineId from the drilldown so the mock satisfies the new
             // citation-required schema and represents what a real Codex call would do.
-            var firstLineId = drilldown?["currentTransactions"]?.AsArray()?.FirstOrDefault()?["journalLineId"]?.GetValue<string>()
-                              ?? drilldown?["priorTransactions"]?.AsArray()?.FirstOrDefault()?["journalLineId"]?.GetValue<string>()
-                              ?? "mock-line-1";
+            var firstLineId = ExtractJournalLineIds(snapshotJson).FirstOrDefault() ?? "";
 
             return JsonSerializer.Serialize(new
             {
@@ -1224,7 +1291,7 @@ public sealed class CodexWorker(
                 hypotheses = new[]
                 {
                     new { rank = 1, label = $"Driver: {driver}", confidence = 0.72m, journalLineIds = new[] { firstLineId } },
-                    new { rank = 2, label = "Timing / accrual", confidence = 0.18m, journalLineIds = Array.Empty<string>() }
+                    new { rank = 2, label = "Timing / accrual", confidence = 0.18m, journalLineIds = new[] { firstLineId } }
                 },
                 evidence = new[] { new { journalLineId = firstLineId, accountCode = topAccount?.name ?? "", note = driver } },
                 operations = new[] { new { op = "set_flux_explanation", targetType = "fluxReviewGroup", targetId = group?["id"]?.GetValue<string>(), value = new { explanation }, reason = "AI variance explanation draft" } }
@@ -1238,7 +1305,7 @@ public sealed class CodexWorker(
                 suggestedExplanation = "The selected line changed materially between periods. Review the account-level and journal detail before approving the final explanation.",
                 confidence = 0.55m,
                 hypotheses = new[] { new { rank = 1, label = "Insufficient context", confidence = 0.40m, journalLineIds = Array.Empty<string>() } },
-                evidence = new[] { new { journalLineId = "mock-line-1", accountCode = "", note = "fallback" } },
+                evidence = Array.Empty<object>(),
                 operations = Array.Empty<object>()
             }, new JsonSerializerOptions(JsonSerializerDefaults.Web));
         }

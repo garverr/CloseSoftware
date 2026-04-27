@@ -42,6 +42,10 @@ public static class FluxEndpoints
             {
                 return Results.Forbid();
             }
+            if (await EndpointHelpers.RejectIfPackageApprovedAsync(db, packageId, ct) is { } locked)
+            {
+                return locked;
+            }
 
             var result = await flux.RefreshAsync(packageId, ct);
             await EndpointHelpers.AuditAsync(db, http, "flux.refresh", "ReportPackage", packageId, packageId, "Refreshed flux review from current ledger/statement data", "{}", JsonSerializer.Serialize(result), ct);
@@ -59,6 +63,10 @@ public static class FluxEndpoints
             if (!EndpointHelpers.Can(http, "Admin", "Finance Editor", "Reviewer"))
             {
                 return Results.Forbid();
+            }
+            if (await EndpointHelpers.RejectIfPackageApprovedAsync(db, packageId, ct) is { } locked)
+            {
+                return locked;
             }
 
             var result = await flux.PullLedgerDetailAsync(packageId, ct);
@@ -99,6 +107,10 @@ public static class FluxEndpoints
             {
                 return Results.Forbid();
             }
+            if (await EndpointHelpers.RejectIfFluxGroupPackageApprovedAsync(db, groupId, ct) is { } locked)
+            {
+                return locked;
+            }
 
             var before = await db.FluxReviewGroups.AsNoTracking().FirstOrDefaultAsync(x => x.Id == groupId, ct);
             var result = await flux.UpdateSettingsAsync(groupId, request, ct);
@@ -119,6 +131,10 @@ public static class FluxEndpoints
             {
                 return Results.Forbid();
             }
+            if (await EndpointHelpers.RejectIfFluxGroupPackageApprovedAsync(db, groupId, ct) is { } locked)
+            {
+                return locked;
+            }
 
             var before = await db.FluxReviewGroups.AsNoTracking().FirstOrDefaultAsync(x => x.Id == groupId, ct);
             var result = await flux.SignOffAsync(groupId, request.Action ?? "prepare", EndpointHelpers.Actor(http), ct);
@@ -137,6 +153,10 @@ public static class FluxEndpoints
             if (!EndpointHelpers.Can(http, "Admin", "Finance Editor", "Reviewer"))
             {
                 return Results.Forbid();
+            }
+            if (await EndpointHelpers.RejectIfFluxGroupPackageApprovedAsync(db, groupId, ct) is { } locked)
+            {
+                return locked;
             }
 
             var before = await db.FluxReviewGroups.AsNoTracking().FirstOrDefaultAsync(x => x.Id == groupId, ct);
@@ -157,6 +177,10 @@ public static class FluxEndpoints
             if (!EndpointHelpers.Can(http, "Admin", "Finance Editor", "Reviewer"))
             {
                 return Results.Forbid();
+            }
+            if (await EndpointHelpers.RejectIfFluxGroupPackageApprovedAsync(db, groupId, ct) is { } locked)
+            {
+                return locked;
             }
 
             if (string.IsNullOrWhiteSpace(request.Explanation))
@@ -182,6 +206,10 @@ public static class FluxEndpoints
             {
                 return Results.Forbid();
             }
+            if (await EndpointHelpers.RejectIfFluxGroupPackageApprovedAsync(db, groupId, ct) is { } locked)
+            {
+                return locked;
+            }
 
             var before = await db.FluxReviewGroups.AsNoTracking().FirstOrDefaultAsync(x => x.Id == groupId, ct);
             var result = await flux.ApproveAsync(groupId, EndpointHelpers.Actor(http), ct);
@@ -203,6 +231,10 @@ public static class FluxEndpoints
             {
                 return Results.Forbid();
             }
+            if (await EndpointHelpers.RejectIfFluxGroupPackageApprovedAsync(db, groupId, ct) is { } locked)
+            {
+                return locked;
+            }
 
             var group = await db.FluxReviewGroups.FirstOrDefaultAsync(x => x.Id == groupId, ct);
             if (group is null)
@@ -212,6 +244,10 @@ public static class FluxEndpoints
 
             var setting = await db.AiRuntimeSettings.AsNoTracking().FirstOrDefaultAsync(x => x.Module == "flux-explain", ct);
             var snapshot = await flux.BuildAiExplanationSnapshotAsync(groupId, ct);
+            if (!snapshot.Contains("\"journalLineId\"", StringComparison.OrdinalIgnoreCase))
+            {
+                return Results.BadRequest(new { message = "Pull ledger detail before queueing an AI flux explanation so citations can be tied to source journal lines." });
+            }
             var run = new AiRun
             {
                 Id = Guid.NewGuid(),
@@ -251,6 +287,10 @@ public static class FluxEndpoints
             {
                 return Results.Forbid();
             }
+            if (await EndpointHelpers.RejectIfPackageApprovedAsync(db, packageId, ct) is { } locked)
+            {
+                return locked;
+            }
 
             var result = await drafts.CreateDraftsAsync(packageId, ct);
             await EndpointHelpers.AuditAsync(db, http, "ai-package-draft.create", "ReportPackage", packageId, packageId, "Created staged AI package draft suggestions", "{}", JsonSerializer.Serialize(result), ct);
@@ -271,6 +311,14 @@ public static class FluxEndpoints
             }
 
             var before = await db.AiPackageDraftSuggestions.AsNoTracking().FirstOrDefaultAsync(x => x.Id == draftId, ct);
+            if (before is null)
+            {
+                return Results.NotFound();
+            }
+            if (await EndpointHelpers.RejectIfPackageApprovedAsync(db, before.ReportPackageId, ct) is { } locked)
+            {
+                return locked;
+            }
             var result = await drafts.AcceptAsync(draftId, ct);
             await EndpointHelpers.AuditAsync(db, http, "ai-package-draft.accept", "AiPackageDraftSuggestion", draftId, result.ReportPackageId, "Accepted staged AI package suggestion", JsonSerializer.Serialize(before), JsonSerializer.Serialize(result), ct);
             await db.SaveChangesAsync(ct);
@@ -291,6 +339,14 @@ public static class FluxEndpoints
             }
 
             var before = await db.AiPackageDraftSuggestions.AsNoTracking().FirstOrDefaultAsync(x => x.Id == draftId, ct);
+            if (before is null)
+            {
+                return Results.NotFound();
+            }
+            if (await EndpointHelpers.RejectIfPackageApprovedAsync(db, before.ReportPackageId, ct) is { } locked)
+            {
+                return locked;
+            }
             var result = await drafts.RejectAsync(draftId, request.Reason, ct);
             await EndpointHelpers.AuditAsync(db, http, "ai-package-draft.reject", "AiPackageDraftSuggestion", draftId, result.ReportPackageId, request.Reason ?? "Rejected staged AI package suggestion", JsonSerializer.Serialize(before), JsonSerializer.Serialize(result), ct);
             await db.SaveChangesAsync(ct);
