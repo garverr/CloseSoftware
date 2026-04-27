@@ -1,0 +1,45 @@
+# Best-in-Class Review — Agent 06: Flux Drilldown & Trend Integration
+
+**Categories:** 11 (Account-level drill-down UX & GL traversal), 16 (Multi-period trend integration)
+
+**Reviewed:** 2026-04-27
+**Files examined:** `src/FinancialReporting.Web/src/App.tsx`, `src/FinancialReporting.Api/Program.cs`, `src/FinancialReporting.Api/Services/XeroLedgerServices.cs`, `src/FinancialReporting.Web/src/App.css`
+
+---
+
+## Category 11 — Account-Level Drill-Down UX & GL Traversal
+
+| Severity | Finding | Evidence | Best-in-class gap | Recommendation |
+|---|---|---|---|---|
+| **Blocker** | No deep-link to original Xero document. The transaction table renders Date, Journal#, Description, Source, Amount — no clickable link to the Xero invoice/bill/manual journal. | `App.tsx:2242` (table headers); `FluxLedgerTransactionDto` record at `XeroLedgerServices.cs:2285-2293` has zero URL fields; `ParsedJournal` at line 976 never captures a document URL from the Xero payload. | Fathom and Closecore both surface a one-click "open in Xero" link on every GL line. The Xero Journals API response includes `SourceID` (the originating transaction GUID) which can construct `https://go.xero.com/AccountsPayable/View.aspx?invoiceID={SourceID}`. | Capture `SourceID` from the Xero journal payload in `ParseJournals` (line 826+), store it on `XeroJournal`, propagate through `FluxLedgerTransactionDto`, and render an external link icon in `TransactionTable`. |
+| **Blocker** | GL table is hard-capped at 50 rows client-side with no pagination or load-more control. The API already limits to 150 rows server-side (`Take(150)` at `XeroLedgerServices.cs:1893`). Accounts with high-volume activity (payroll, AP) silently truncate. | `App.tsx:2245` — `rows.slice(0, 50)`. No pagination state, no "load more" button, no scroll-triggered fetch. | Closecore and Fathom both provide paginated or virtualised GL lists that expose all lines. | Replace the hard slice with a `showAll` toggle or add server-side pagination via `?skip=&take=` query params on `GET /api/flux-review/groups/{id}/drilldown`. |
+| **Major** | No filtering on the GL transaction table. A reviewer cannot filter by date range, vendor/contact name, memo/description, or source type within the drilldown panel. | `App.tsx:2233-2258` — `TransactionTable` accepts only `title` and `rows`; no filter inputs rendered. | Closecore's variance navigation exposes date, vendor, and memo filters inline. Fathom allows free-text search across journal descriptions. | Add a lightweight filter bar (date range, free-text memo/description, source type) inside `TransactionTable`. Filtering can be purely client-side against the 150-row payload. |
+| **Major** | No vendor/contact name is surfaced on GL lines. The journal model stores only `Reference` and `Description` copied from the Xero line. The Xero `Journals` endpoint does not embed contact name; however `SourceID` resolution or a secondary fetch from the Contacts API would supply it. | `XeroLedgerServices.cs:976-977` — `ParsedJournal` / `ParsedJournalLine` fields; `ParseJournals` at line 826 never reads `ContactID` or `ContactName` from the payload. | Fathom shows payee/vendor on every GL row, enabling reviewers to spot vendor concentration instantly. | Read `ContactID` from the raw journal payload during `ParseJournals` and store on `XeroJournal`; resolve contact name lazily or via a join table. |
+| **Minor** | Drill path requires two actions: (1) click flux group → drilldown loads; (2) click account row → GL lines appear. This is reasonable but the account row click has no visual loading state while `currentTransactions` is part of the initial drilldown payload — so loading feels instant but there is no affordance if the payload is slow. | `App.tsx:2077` (group click triggers `loadDrilldown`), `App.tsx:2196` (account row click is synchronous). | Fathom shows a spinner per-row during async loads. | Add a skeleton/loading state to the detail card while `drilldown === null` (already handled at line 2108) — already partially in place; extend to show row-level skeleton for the account list. |
+
+---
+
+## Category 16 — Multi-Period Trend Integration (3 / 6 / 12 Month)
+
+| Severity | Finding | Evidence | Best-in-class gap | Recommendation |
+|---|---|---|---|---|
+| **Blocker** | Trend data is fixed at 6 months with no user-selectable window (3 / 6 / 12). `BuildTrendJsonAsync` uses a hard-coded `AddMonths(-5)` lookback, producing at most 6 data points. There is no API parameter or UI control to widen to 12 months. | `XeroLedgerServices.cs:1634` — `.Where(x => x.PeriodStart >= package.ReportingPeriod.PeriodStart.AddMonths(-5))`. `App.tsx:1997` — `selectedTrend` parsed directly from `group.trendJson`; no window selector in `FluxReviewPanel`. | Fathom lets reviewers select 3 / 6 / 12 months inline; Closecore shows a rolling 12-month mini-bar chart to contextualise whether the flagged variance is an outlier or a structural shift. | Add a `trendMonths` parameter to `BuildTrendJsonAsync` (default 12, max 24). Expose a 3/6/12 toggle in `FluxReviewPanel` above the trend strip. Pass the chosen window to a new query param on the drilldown endpoint or store multiple precomputed windows in `TrendJson`. |
+| **Blocker** | The trend strip is a text-only grid of labelled amounts — no chart line, bar, or sparkline. A reviewer cannot visually detect seasonality, slope, or outlier without reading six numbers. | `App.tsx:2174-2182` — `div.flux-trend-strip` renders `<span>{point.periodKey}</span><strong>{fmtMoney(point.amount)}</strong>` inside a CSS grid. `App.css:835-852` — pure grid layout, no SVG. The `Sparkline` SVG component exists at `App.tsx:4800` but is not used in the flux trend strip. | Fathom and Closecore both render a mini bar/line chart for the historical trend alongside each flux line. This is the primary mechanism by which a reviewer judges "is this month unusual?" | Wire the existing `Sparkline` component (or `ColumnChart`) into the trend strip. Extract `amount` values from `selectedTrend` as the `current` prop array. This is a low-effort change using already-written code. |
+| **Major** | Trend is computed at flux-group level only, not at the individual account level. When a reviewer drills into a specific account within a group, there is no per-account trend visible. | `XeroLedgerServices.cs:1574-1665` — `HydrateFluxReviewContextAsync` calls `BuildTrendJsonAsync` per `FluxReviewGroup`, not per account. `FluxReviewAccountDto` at line 2275 has no trend field. | Fathom shows per-account trend in the account drilldown. | Build per-account trend data within `GetDrilldownAsync` and attach it to `FluxReviewAccountDto`. This reuses the same period query already executed for the group. |
+| **Minor** | Prior year comparison in the trend strip is absent. The strip shows only `MonthOverMonth` balance history; there is no visual overlay of the equivalent period last year, making seasonality detection harder. | `App.tsx:1997` — `selectedTrend` is a flat `{ periodKey, amount }[]` array; no prior-year series is computed or stored. | Closecore overlays PY values on the trend chart as a reference line. | Add a `priorYearTrendJson` field to `FluxReviewGroup` using the same look-back logic offset by 12 months. Render as a dashed reference line in the sparkline (the `Sparkline` component already supports a `prior` prop at `App.tsx:4800`). |
+
+---
+
+## Pillar Verdict — Flux + AI GL Investigation
+
+The flux module has solid structural bones: a two-click path from variance to journal lines is working (`FluxReviewPanel` → `loadDrilldown` → `TransactionTable`), workflow sign-off, AI explanation queuing, and per-group threshold tuning are all present. However the drill path stops short of the original Xero document (no deep-link URL), the GL table is silently truncated and unfiltered, and the trend strip is numbers-only with a hard 6-month window. These gaps mean a reviewer cannot complete a Fathom- or Closecore-quality investigation without leaving the app. The pillar is **functional but not best-in-class**.
+
+---
+
+## Top 3 Fixes (Highest ROI, Lowest Risk)
+
+1. **Add Xero deep-link on each GL row (Blocker / Cat 11).** Capture `SourceID` in `ParseJournals` (`XeroLedgerServices.cs:826`), propagate through `FluxLedgerTransactionDto`, render as an `<a href target="_blank">` icon in `TransactionTable` (`App.tsx:2245`). No schema migration needed if stored in `PayloadJson` and derived on read.
+
+2. **Wire `Sparkline` into the flux trend strip (Blocker / Cat 16).** The component already exists at `App.tsx:4800`. One line of JSX replaces the text grid at `App.tsx:2174`. Simultaneously, extend `BuildTrendJsonAsync` (`XeroLedgerServices.cs:1634`) from `AddMonths(-5)` to `AddMonths(-11)` (12-month default) and add a 3/6/12 toggle in the panel.
+
+3. **Remove the 50-row client-side cap and add a description filter (Blocker + Major / Cat 11).** Replace `rows.slice(0, 50)` at `App.tsx:2245` with a `useState` filter + "show all" toggle. Add a text input above the table that filters `description` and `reference` fields client-side against the 150-row API payload — zero backend changes required.
