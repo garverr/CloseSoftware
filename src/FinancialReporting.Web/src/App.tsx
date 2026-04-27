@@ -1715,6 +1715,8 @@ function FluxReviewPanel({
           <option value="open">Open explanations</option>
           <option value="prepared">Prepared</option>
           <option value="reviewed">Reviewed</option>
+          <option value="assigned">Assigned</option>
+          <option value="late">Late</option>
           <option value="ungrouped">Ungrouped accounts</option>
           <option value="all">All groups</option>
         </select>
@@ -1739,6 +1741,7 @@ function FluxReviewPanel({
                     <span className={`status-pill ${group.status === 'Approved' ? 'good' : group.requiresExplanation ? 'warn' : ''}`}>{group.status}</span>
                     {group.assignee && <span>Owner {group.assignee}</span>}
                     {group.dueDate && <span>Due {group.dueDate}</span>}
+                    {group.tags && <span>{group.tags}</span>}
                     {group.autoSignedOff && <span>Auto signed-off</span>}
                   </div>
                   {editing === group.id ? (
@@ -1783,6 +1786,13 @@ function FluxReviewPanel({
                       <input value={settingsForm.percentThreshold} onChange={(event) => setSettingsForm((current) => ({ ...current, percentThreshold: event.target.value }))} />
                     </div>
                     <div>
+                      <label>Threshold logic</label>
+                      <select value={settingsForm.thresholdLogic} onChange={(event) => setSettingsForm((current) => ({ ...current, thresholdLogic: event.target.value }))}>
+                        <option value="OR">Amount or percent</option>
+                        <option value="AND">Amount and percent</option>
+                      </select>
+                    </div>
+                    <div>
                       <label>Assignee</label>
                       <input value={settingsForm.assignee} onChange={(event) => setSettingsForm((current) => ({ ...current, assignee: event.target.value }))} placeholder="Finance owner" />
                     </div>
@@ -1793,6 +1803,17 @@ function FluxReviewPanel({
                     <div>
                       <label>Due date</label>
                       <input value={settingsForm.dueDate} onChange={(event) => setSettingsForm((current) => ({ ...current, dueDate: event.target.value }))} placeholder="YYYY-MM-DD" />
+                    </div>
+                    <div>
+                      <label>Tags</label>
+                      <input value={settingsForm.tags} onChange={(event) => setSettingsForm((current) => ({ ...current, tags: event.target.value }))} placeholder="close, audit, board" />
+                    </div>
+                    <div>
+                      <label>Apply to</label>
+                      <select value={settingsForm.applyScope} onChange={(event) => setSettingsForm((current) => ({ ...current, applyScope: event.target.value }))}>
+                        <option value="period">This period only</option>
+                        <option value="future">This period and going forward</option>
+                      </select>
                     </div>
                     <Button variant="secondary" onClick={saveSettings}>Save settings</Button>
                     <label className="wide">Explanation template</label>
