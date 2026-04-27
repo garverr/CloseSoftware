@@ -39,6 +39,8 @@ const requiredUiWiring = [
   '/api/mapping/fs-lines',
   '/api/kpis',
   '/api/packages/${packageData.id}/theme',
+  '/api/packages/${packageData.id}/reporting-studio',
+  '/api/packages/${packageData.id}/reporting-studio/apply',
   '/api/exports/pdf',
   '/api/exports/excel',
   '/api/share-links',
@@ -89,5 +91,18 @@ ok(Array.isArray(xero.connections), 'Xero connections expose tenant list')
 
 const versions = await readJson(`${apiUrl}/api/packages/${currentPackage.id}/versions`)
 ok(Array.isArray(versions), 'package versions load')
+
+const studio = await readJson(`${apiUrl}/api/packages/${currentPackage.id}/reporting-studio`)
+ok(Array.isArray(studio.contentLibrary) && studio.contentLibrary.length > 0, 'reporting studio content library loads')
+ok(Array.isArray(studio.qualityChecks) && studio.qualityChecks.length > 0, 'reporting studio readiness checks load')
+ok(studio.settings && Array.isArray(studio.settings.reportSections), 'reporting studio package settings load')
+ok(appSource.includes('ReportingStudioView'), 'frontend renders reporting studio view')
+ok(appSource.includes('reportComponentLibrary'), 'financial package editor exposes module library')
+ok(appSource.includes('BlockInspector'), 'financial package editor exposes component inspector')
+ok(appSource.includes('nearestReportWidth'), 'financial package editor supports snapped horizontal resizing')
+ok(appSource.includes('composition-pie'), 'financial package editor exposes composition charts')
+ok(appSource.includes('variance-waterfall'), 'financial package editor exposes variance waterfall charts')
+ok(appSource.includes('account-composition'), 'financial package editor exposes account composition tables')
+ok(appSource.includes('blockReason'), 'financial package editor surfaces blocked or stale package reasons')
 
 console.log(`Frontend smoke passed (${checks.length} checks).`)
