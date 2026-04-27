@@ -229,6 +229,7 @@ public sealed class XeroBackfillService(
     IDataProtectionProvider dataProtectionProvider,
     XeroTenantLedgerService ledgerService,
     XeroApiRequestScheduler scheduler,
+    XeroTokenRefreshLock refreshLock,
     ILogger<XeroBackfillService> logger)
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
@@ -485,6 +486,14 @@ public sealed class XeroBackfillService(
 
             try
             {
+                // P0.6 — Sync the authoritative chart of accounts before projecting GL so
+                // ProjectGlForPeriodAsync can look up Type/Class from Xero rather than
+                // guessing from net-amount sign. Cat 3.
+                await SyncChartOfAccountsAsync(db, client, tenant, rawCallHeaders, cancellationToken);
+                // Vendor cache so flux can resolve ContactName for ACCREC/ACCPAY journals
+                // where the ContactID is captured but the inline Contact node isn't. Cat 14.
+                await SyncContactsAsync(db, client, tenant, rawCallHeaders, cancellationToken);
+
                 var journals = await ImportJournalsAsync(db, client, tenant, from.Start, to.End, rawCallHeaders, cancellationToken);
                 actualCalls += journals.Calls;
                 task.JournalsImported += journals.JournalsImported;
@@ -550,6 +559,128 @@ public sealed class XeroBackfillService(
             logger.LogError(ex, "Xero tenant backfill failed for {TenantId}.", task.TenantId);
             await db.SaveChangesAsync(cancellationToken);
         }
+    }
+
+    /// <summary>
+    /// Fetch /Accounts (including archived) from Xero and upsert the authoritative chart
+    /// of accounts. Replaces the prior GuessTypeFromAmount sign heuristic. Cat 3.
+    /// </summary>
+    private async Task SyncChartOfAccountsAsync(
+        AppDbContext db,
+        HttpClient client,
+        XeroTenantConnection tenant,
+        List<Dictionary<string, string>> rateHeaders,
+        CancellationToken cancellationToken)
+    {
+        var apiBase = configuration["Xero:ApiBaseUrl"] ?? "https://api.xero.com/api.xro/2.0";
+        var url = $"{apiBase.TrimEnd('/')}/Accounts?includeArchived=true";
+        var response = await scheduler.GetStringAsync(client, tenant.TenantId, url, cancellationToken);
+        rateHeaders.Add(response.RateLimitHeaders);
+        if (!response.IsSuccess)
+        {
+            logger.LogWarning(
+                "Xero /Accounts returned {Status} for tenant {TenantId}; COA sync skipped.",
+                response.StatusCode, tenant.TenantId);
+            return;
+        }
+
+        using var document = JsonDocument.Parse(response.Content);
+        if (!document.RootElement.TryGetProperty("Accounts", out var accounts) || accounts.ValueKind != JsonValueKind.Array)
+        {
+            return;
+        }
+
+        var existing = await db.XeroChartOfAccounts
+            .Where(x => x.TenantId == tenant.TenantId)
+            .ToDictionaryAsync(x => x.Code, StringComparer.OrdinalIgnoreCase, cancellationToken);
+
+        foreach (var account in accounts.EnumerateArray())
+        {
+            var code = ReadString(account, "Code");
+            if (string.IsNullOrWhiteSpace(code))
+            {
+                continue;
+            }
+
+            if (!existing.TryGetValue(code, out var row))
+            {
+                row = new XeroChartOfAccount
+                {
+                    Id = Guid.NewGuid(),
+                    TenantId = tenant.TenantId,
+                    Code = code
+                };
+                db.XeroChartOfAccounts.Add(row);
+                existing[code] = row;
+            }
+
+            row.Name = ReadString(account, "Name") ?? row.Name;
+            row.Type = ReadString(account, "Type") ?? row.Type;
+            row.Class = ReadString(account, "Class") ?? row.Class;
+            var status = ReadString(account, "Status") ?? "ACTIVE";
+            row.Status = status;
+            row.IsArchived = status.Equals("ARCHIVED", StringComparison.OrdinalIgnoreCase);
+            row.ReportingCode = ReadString(account, "ReportingCode") ?? "";
+            row.SyncedAt = DateTimeOffset.UtcNow;
+        }
+
+        await db.SaveChangesAsync(cancellationToken);
+    }
+
+    private static string? ReadString(JsonElement element, string name)
+        => element.TryGetProperty(name, out var prop) && prop.ValueKind == JsonValueKind.String
+            ? prop.GetString()
+            : null;
+
+    /// <summary>Fetch /Contacts and upsert the local cache. Cat 14.</summary>
+    private async Task SyncContactsAsync(
+        AppDbContext db,
+        HttpClient client,
+        XeroTenantConnection tenant,
+        List<Dictionary<string, string>> rateHeaders,
+        CancellationToken cancellationToken)
+    {
+        var apiBase = configuration["Xero:ApiBaseUrl"] ?? "https://api.xero.com/api.xro/2.0";
+        // Pull active + archived; archived contacts may still appear on historical journals.
+        var url = $"{apiBase.TrimEnd('/')}/Contacts?includeArchived=true";
+        var response = await scheduler.GetStringAsync(client, tenant.TenantId, url, cancellationToken);
+        rateHeaders.Add(response.RateLimitHeaders);
+        if (!response.IsSuccess)
+        {
+            logger.LogWarning("Xero /Contacts returned {Status} for tenant {TenantId}; vendor cache skipped.", response.StatusCode, tenant.TenantId);
+            return;
+        }
+
+        using var document = JsonDocument.Parse(response.Content);
+        if (!document.RootElement.TryGetProperty("Contacts", out var contacts) || contacts.ValueKind != JsonValueKind.Array)
+        {
+            return;
+        }
+
+        var existing = await db.XeroContacts
+            .Where(x => x.TenantId == tenant.TenantId)
+            .ToDictionaryAsync(x => x.ContactId, StringComparer.OrdinalIgnoreCase, cancellationToken);
+
+        foreach (var contact in contacts.EnumerateArray())
+        {
+            var contactId = ReadString(contact, "ContactID") ?? ReadString(contact, "ContactId");
+            if (string.IsNullOrWhiteSpace(contactId))
+            {
+                continue;
+            }
+            if (!existing.TryGetValue(contactId, out var row))
+            {
+                row = new XeroContact { Id = Guid.NewGuid(), TenantId = tenant.TenantId, ContactId = contactId };
+                db.XeroContacts.Add(row);
+                existing[contactId] = row;
+            }
+            row.Name = ReadString(contact, "Name") ?? row.Name;
+            row.Status = ReadString(contact, "ContactStatus") ?? row.Status;
+            row.IsCustomer = contact.TryGetProperty("IsCustomer", out var c) && c.ValueKind == JsonValueKind.True;
+            row.IsSupplier = contact.TryGetProperty("IsSupplier", out var s) && s.ValueKind == JsonValueKind.True;
+            row.SyncedAt = DateTimeOffset.UtcNow;
+        }
+        await db.SaveChangesAsync(cancellationToken);
     }
 
     private async Task<JournalImportStats> ImportJournalsAsync(
@@ -624,6 +755,18 @@ public sealed class XeroBackfillService(
         CancellationToken cancellationToken)
     {
         var period = await EnsureReportingPeriodAsync(db, month.Start, cancellationToken);
+
+        // SECURITY/INTEGRITY: never overwrite financial statement data for a closed period.
+        // The previous behavior unconditionally ExecuteDeleteAsync'd FinancialStatementLines
+        // for the period, which would silently invalidate a signed-off close packet on a
+        // re-sync. Cat 8, 31. Skip with a warning so the rest of the run continues.
+        if (period.IsClosed)
+        {
+            logger.LogWarning(
+                "Skipping monthly statement import for closed period {PeriodKey} on tenant {TenantId}.",
+                month.Key, tenant.TenantId);
+            return 0;
+        }
         var apiBase = configuration["Xero:ApiBaseUrl"] ?? "https://api.xero.com/api.xro/2.0";
         var reports = new[]
         {
@@ -729,6 +872,25 @@ public sealed class XeroBackfillService(
     private async Task ProjectGlForPeriodAsync(AppDbContext db, string tenantId, Guid organizationId, BackfillMonth month, CancellationToken cancellationToken)
     {
         var period = await EnsureReportingPeriodAsync(db, month.Start, cancellationToken);
+
+        // INTEGRITY: a closed period's GL projection is final. Re-running would delete
+        // existing GlTransactions and re-derive, which can silently invalidate sign-offs
+        // when a late journal is later re-imported. Cat 8, 31.
+        if (period.IsClosed)
+        {
+            logger.LogWarning(
+                "Skipping GL projection for closed period {PeriodKey} on tenant {TenantId}.",
+                month.Key, tenantId);
+            return;
+        }
+
+        // P0.6 — load the authoritative COA cache once per period so we can look up
+        // Type/Class instead of guessing from net-amount sign. Cat 3.
+        var coa = await db.XeroChartOfAccounts
+            .AsNoTracking()
+            .Where(x => x.TenantId == tenantId)
+            .ToDictionaryAsync(x => x.Code, StringComparer.OrdinalIgnoreCase, cancellationToken);
+
         var journals = await db.XeroJournals
             .AsNoTracking()
             .Include(x => x.Lines)
@@ -787,8 +949,19 @@ public sealed class XeroBackfillService(
             }
 
             account.Name = string.IsNullOrWhiteSpace(group.Key.AccountName) ? group.Key.AccountCode : group.Key.AccountName;
-            account.Type = GuessTypeFromAmount(group.Sum(x => x.NetAmount));
-            account.Class = account.Type == "Expense" ? "Operating Expense" : "Income Statement";
+            // Prefer the authoritative COA Type/Class. Fall back to the legacy sign-heuristic
+            // only if the COA cache is empty (e.g. /Accounts call failed for this tenant).
+            // Cat 3.
+            if (coa.TryGetValue(group.Key.AccountCode, out var coaRow) && !string.IsNullOrWhiteSpace(coaRow.Type))
+            {
+                account.Type = NormalizeCoaType(coaRow.Type);
+                account.Class = NormalizeCoaClass(coaRow.Class, coaRow.Type);
+            }
+            else
+            {
+                account.Type = GuessTypeFromAmount(group.Sum(x => x.NetAmount));
+                account.Class = account.Type == "Expense" ? "Operating Expense" : "Income Statement";
+            }
             var suggestedFsLine = SuggestFsLineFromDefinitions(account.Name, account.Type, fsLineDefinitions) ?? GuessFsLine(account.Name, account.Type);
             account.FsLine = string.IsNullOrWhiteSpace(account.FsLine) ? suggestedFsLine : account.FsLine;
             account.AiSuggestedFsLine = suggestedFsLine;
@@ -1130,6 +1303,14 @@ public sealed class XeroBackfillService(
             return Unprotect(tenant.EncryptedAccessToken);
         }
 
+        // Per-tenant lock with re-check inside it. Cat 1.
+        using var _ = await refreshLock.AcquireAsync(tenant.TenantId, cancellationToken);
+        await db.Entry(tenant).ReloadAsync(cancellationToken);
+        if (tenant.TokenExpiresAt > DateTimeOffset.UtcNow.AddMinutes(5))
+        {
+            return Unprotect(tenant.EncryptedAccessToken);
+        }
+
         var refreshToken = Unprotect(tenant.EncryptedRefreshToken);
         if (string.IsNullOrWhiteSpace(refreshToken))
         {
@@ -1219,7 +1400,9 @@ public sealed class XeroBackfillService(
         }
         catch (CryptographicException)
         {
-            return value.StartsWith("ey", StringComparison.Ordinal) ? value : "";
+            // SECURITY: removed silent "ey"-prefix plaintext fallback. See FinancialServices.Unprotect for rationale. Cat 1.
+            throw new InvalidOperationException(
+                "Xero token decryption failed; reconnect the tenant.");
         }
     }
 
@@ -1306,8 +1489,51 @@ public sealed class XeroBackfillService(
     private static string DateParam(DateOnly date)
         => date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
 
+    /// <summary>Legacy fallback used only when the Xero /Accounts COA cache is unavailable. Cat 3.</summary>
     private static string GuessTypeFromAmount(decimal amount)
         => amount < 0 ? "Expense" : "Revenue";
+
+    /// <summary>Normalize Xero AccountType (e.g. EXPENSE, REVENUE, DIRECTCOSTS) into the
+    /// internal Type vocabulary used by mapping/flux engines.</summary>
+    private static string NormalizeCoaType(string xeroType)
+    {
+        var t = xeroType.ToUpperInvariant();
+        return t switch
+        {
+            "EXPENSE" or "OVERHEADS" or "OTHEREXPENSE" or "DEPRECIATN" => "Expense",
+            "DIRECTCOSTS" => "Cost of Goods Sold",
+            "REVENUE" or "SALES" or "OTHERINCOME" => "Revenue",
+            "BANK" or "CURRENT" or "FIXED" or "INVENTORY" or "NONCURRENT" or "PREPAYMENT" => "Asset",
+            "CURRLIAB" or "LIABILITY" or "NONCURRLIAB" or "TERMLIAB" => "Liability",
+            "EQUITY" => "Equity",
+            _ => xeroType
+        };
+    }
+
+    private static string NormalizeCoaClass(string xeroClass, string xeroType)
+    {
+        if (!string.IsNullOrWhiteSpace(xeroClass))
+        {
+            return xeroClass switch
+            {
+                "ASSET" => "Asset",
+                "LIABILITY" => "Liability",
+                "EQUITY" => "Equity",
+                "REVENUE" => "Income Statement",
+                "EXPENSE" => "Operating Expense",
+                _ => xeroClass
+            };
+        }
+        return NormalizeCoaType(xeroType) switch
+        {
+            "Expense" or "Cost of Goods Sold" => "Operating Expense",
+            "Revenue" => "Income Statement",
+            "Asset" => "Asset",
+            "Liability" => "Liability",
+            "Equity" => "Equity",
+            _ => "Income Statement"
+        };
+    }
 
     private static string GuessFsLine(string name, string type)
         => type == "Expense" ? $"Operating Expense - {name}" : $"Revenue - {name}";

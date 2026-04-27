@@ -17,6 +17,7 @@ public sealed class XeroTenantLedgerService(
     IConfiguration configuration,
     IHttpClientFactory httpClientFactory,
     IDataProtectionProvider dataProtectionProvider,
+    XeroTokenRefreshLock refreshLock,
     ILogger<XeroTenantLedgerService> logger)
 {
     private const string LedgerScope = "accounting.journals.read";
@@ -52,8 +53,11 @@ public sealed class XeroTenantLedgerService(
         var reconnectRequired = 0;
         foreach (var row in rows.Connections)
         {
-            var accessToken = Unprotect(row.AccessToken);
-            var refreshToken = Unprotect(row.RefreshToken);
+            // V2 tokens may have been encrypted by a different DataProtection application
+            // name / key ring. Use the non-throwing variant so an undecryptable row is
+            // imported as NeedsReconnect rather than aborting the whole loop. Cat 1, 2.
+            var accessToken = TryUnprotect(row.AccessToken) ?? "";
+            var refreshToken = TryUnprotect(row.RefreshToken) ?? "";
             var hasTokens = !string.IsNullOrWhiteSpace(accessToken) && !string.IsNullOrWhiteSpace(refreshToken);
             var hasLedgerScope = HasLedgerScope(row.Scopes);
             var status = hasTokens ? "Connected" : "NeedsReconnect";
@@ -361,11 +365,40 @@ public sealed class XeroTenantLedgerService(
             await db.SaveChangesAsync(cancellationToken);
 
             var accessToken = await EnsureValidTokenAsync(db, tenant, cancellationToken);
-            var payload = await FetchJournalsPayloadAsync(tenant, accessToken, cursor.LastJournalNumber, cancellationToken);
-            var imported = await UpsertJournalsFromPayloadAsync(db, tenant.TenantId, payload, cancellationToken);
-            if (imported.MaxJournalNumber > cursor.LastJournalNumber.GetValueOrDefault())
+
+            // Paginate until the page is empty or the cursor stops advancing. Xero caps each
+            // /Journals response at 100 entries; the previous single-page fetch silently
+            // dropped journals whenever a tenant accumulated >100 between sync cycles.
+            // Backfill (XeroBackfillServices.ImportJournalsAsync) already paginates; this
+            // brings the live path to parity. Cat 4, 6.
+            var maxPages = configuration.GetValue("Xero:LiveSyncMaxJournalPagesPerCycle", 50);
+            var totalJournals = 0;
+            var totalLines = 0;
+            var allActivityDates = new HashSet<DateOnly>();
+            var pageOffset = cursor.LastJournalNumber;
+            for (var page = 0; page < maxPages; page++)
             {
-                cursor.LastJournalNumber = imported.MaxJournalNumber;
+                var payload = await FetchJournalsPayloadAsync(tenant, accessToken, pageOffset, cancellationToken);
+                var imported = await UpsertJournalsFromPayloadAsync(db, tenant.TenantId, payload, cancellationToken);
+                totalJournals += imported.JournalsImported;
+                totalLines += imported.LinesImported;
+                foreach (var date in imported.ActivityDates)
+                {
+                    allActivityDates.Add(date);
+                }
+
+                if (imported.MaxJournalNumber > cursor.LastJournalNumber.GetValueOrDefault())
+                {
+                    cursor.LastJournalNumber = imported.MaxJournalNumber;
+                }
+
+                // Stop when a page returned fewer than the Xero page size or the cursor
+                // didn't advance — both signal "no more new journals".
+                if (imported.JournalsImported == 0 || imported.MaxJournalNumber <= pageOffset.GetValueOrDefault())
+                {
+                    break;
+                }
+                pageOffset = imported.MaxJournalNumber;
             }
 
             cursor.Status = "Completed";
@@ -373,9 +406,9 @@ public sealed class XeroTenantLedgerService(
             cursor.UpdatedAt = DateTimeOffset.UtcNow;
             tenant.LastError = null;
             tenant.UpdatedAt = DateTimeOffset.UtcNow;
-            await MarkPackagesStaleForTenantActivityAsync(db, tenant.TenantId, imported.ActivityDates, cancellationToken);
+            await MarkPackagesStaleForTenantActivityAsync(db, tenant.TenantId, allActivityDates.ToArray(), cancellationToken);
             await db.SaveChangesAsync(cancellationToken);
-            return new XeroTenantLedgerSyncResult(tenant.TenantId, tenant.TenantName, "Completed", imported.JournalsImported, imported.LinesImported, null);
+            return new XeroTenantLedgerSyncResult(tenant.TenantId, tenant.TenantName, "Completed", totalJournals, totalLines, null);
         }
         catch (Exception ex)
         {
@@ -402,6 +435,20 @@ public sealed class XeroTenantLedgerService(
         var maxJournalNumber = 0;
         var activityDates = new HashSet<DateOnly>();
 
+        // Vendor name resolution: if a journal carries ContactID without an inline name,
+        // look it up from the XeroContact cache. Cat 14.
+        var contactIdsNeedingResolution = journals
+            .Where(j => !string.IsNullOrWhiteSpace(j.ContactId) && string.IsNullOrWhiteSpace(j.ContactName))
+            .Select(j => j.ContactId)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var contactNamesById = contactIdsNeedingResolution.Length == 0
+            ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            : await db.XeroContacts
+                .AsNoTracking()
+                .Where(c => c.TenantId == tenantId && contactIdsNeedingResolution.Contains(c.ContactId))
+                .ToDictionaryAsync(c => c.ContactId, c => c.Name, StringComparer.OrdinalIgnoreCase, cancellationToken);
+
         foreach (var source in journals)
         {
             var existing = await db.XeroJournals
@@ -420,6 +467,33 @@ public sealed class XeroTenantLedgerService(
             journal.CreatedDateUtc = source.CreatedDateUtc;
             journal.SourceType = source.SourceType;
             journal.Reference = source.Reference;
+            journal.SourceId = source.SourceId;
+            // Only overwrite contact fields when the new payload actually carries them — a
+            // re-fetched journal payload sometimes drops the embedded Contact node, and we
+            // don't want to clobber a previously-populated ContactName. Cat 14.
+            if (!string.IsNullOrWhiteSpace(source.ContactId))
+            {
+                journal.ContactId = source.ContactId;
+            }
+            if (!string.IsNullOrWhiteSpace(source.ContactName))
+            {
+                journal.ContactName = source.ContactName;
+            }
+            else if (!string.IsNullOrWhiteSpace(source.ContactId)
+                     && contactNamesById.TryGetValue(source.ContactId, out var resolvedName)
+                     && !string.IsNullOrWhiteSpace(resolvedName))
+            {
+                journal.ContactName = resolvedName;
+            }
+            journal.IsVoided = source.IsVoided;
+            if (!string.IsNullOrWhiteSpace(source.CurrencyCode))
+            {
+                journal.CurrencyCode = source.CurrencyCode;
+            }
+            if (source.CurrencyRate > 0m)
+            {
+                journal.CurrencyRate = source.CurrencyRate;
+            }
             journal.PayloadJson = source.PayloadJson;
             journal.UpdatedAt = DateTimeOffset.UtcNow;
             maxJournalNumber = Math.Max(maxJournalNumber, source.JournalNumber);
@@ -608,6 +682,17 @@ public sealed class XeroTenantLedgerService(
 
     private async Task<string> EnsureValidTokenAsync(AppDbContext db, XeroTenantConnection tenant, CancellationToken cancellationToken)
     {
+        // Fast path: token still valid, skip the lock.
+        if (tenant.TokenExpiresAt > DateTimeOffset.UtcNow.AddMinutes(5))
+        {
+            return Unprotect(tenant.EncryptedAccessToken);
+        }
+
+        // Acquire per-tenant lock and re-check inside it. Without this, two concurrent
+        // callers each see an expired token, both POST refresh, and one corrupts the other's
+        // newly-rotated refresh token — leaving the tenant permanently broken. Cat 1.
+        using var _ = await refreshLock.AcquireAsync(tenant.TenantId, cancellationToken);
+        await db.Entry(tenant).ReloadAsync(cancellationToken);
         if (tenant.TokenExpiresAt > DateTimeOffset.UtcNow.AddMinutes(5))
         {
             return Unprotect(tenant.EncryptedAccessToken);
@@ -796,9 +881,32 @@ public sealed class XeroTenantLedgerService(
         {
             return _protector.Unprotect(value);
         }
+        catch (CryptographicException ex)
+        {
+            // SECURITY: see FinancialServices.Unprotect for rationale. The "ey" fallback
+            // bypassed DataProtection silently. We now throw so the caller can mark the
+            // tenant NeedsReconnect rather than forwarding an untrusted credential. Cat 1.
+            throw new InvalidOperationException(
+                "Xero token decryption failed; reconnect the tenant.", ex);
+        }
+    }
+
+    private string? TryUnprotect(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            return value;
+        }
+
+        try
+        {
+            return _protector.Unprotect(value);
+        }
         catch (CryptographicException)
         {
-            return value.StartsWith("ey", StringComparison.Ordinal) ? value : "";
+            // Used by the V2 import path which legitimately probes a foreign key ring and
+            // wants to record "could not decrypt" rather than blow up the whole import loop.
+            return null;
         }
     }
 
@@ -856,6 +964,19 @@ public sealed class XeroTenantLedgerService(
                 }
             }
 
+            // P0.5 — capture per-journal metadata for vendor-pattern detection, void-aware
+            // reconciliation and machine-parseable AI citations. Cat 3, 4, 14, 17.
+            // Some payloads embed Contact at the journal root for ACCREC/ACCPAY-derived
+            // journals; on plain manual journals it is absent and we leave the field empty.
+            var sourceId = ReadString(journal, "SourceID") ?? ReadString(journal, "SourceId") ?? "";
+            var (contactId, contactName) = ReadContact(journal);
+            var status = ReadString(journal, "Status");
+            var isVoided = !string.IsNullOrWhiteSpace(status)
+                && (status.Contains("VOID", StringComparison.OrdinalIgnoreCase)
+                    || status.Contains("DELETED", StringComparison.OrdinalIgnoreCase));
+            var currencyCode = ReadString(journal, "CurrencyCode") ?? "";
+            var currencyRate = ReadDecimal(journal, "CurrencyRate");
+
             journals.Add(new ParsedJournal(
                 id,
                 number,
@@ -863,11 +984,30 @@ public sealed class XeroTenantLedgerService(
                 ReadDateTimeOffset(journal, "CreatedDateUTC"),
                 ReadString(journal, "SourceType") ?? "",
                 ReadString(journal, "Reference") ?? "",
+                sourceId,
+                contactId,
+                contactName,
+                isVoided,
+                currencyCode,
+                currencyRate,
                 journal.GetRawText(),
                 lines));
         }
 
         return journals;
+    }
+
+    private static (string ContactId, string ContactName) ReadContact(JsonElement journal)
+    {
+        if (journal.TryGetProperty("Contact", out var contact) && contact.ValueKind == JsonValueKind.Object)
+        {
+            return (
+                ReadString(contact, "ContactID") ?? ReadString(contact, "ContactId") ?? "",
+                ReadString(contact, "Name") ?? "");
+        }
+        // Some journal payloads expose Contact only on a nested SourceObject; we don't fetch
+        // those eagerly — vendor frequency labels (Cat 14) populate via a separate lookup.
+        return ("", "");
     }
 
     private static Dictionary<string, decimal> ParseTrialBalanceBalances(string payload)
@@ -973,7 +1113,21 @@ public sealed class XeroTenantLedgerService(
 
     private sealed record FinanceAppV2Rows(string Source, List<FinanceAppV2ConnectionRow> Connections);
     private sealed record FinanceAppV2ConnectionRow(string TenantId, string TenantName, string TenantType, string AccessToken, string RefreshToken, DateTimeOffset TokenExpiresAt, string Scopes, string ConnectionStatus, DateTimeOffset? LastConnectedAt, string OrgName, string OrgCode);
-    private sealed record ParsedJournal(string XeroJournalId, int JournalNumber, DateOnly JournalDate, DateTimeOffset? CreatedDateUtc, string SourceType, string Reference, string PayloadJson, List<ParsedJournalLine> Lines);
+    private sealed record ParsedJournal(
+        string XeroJournalId,
+        int JournalNumber,
+        DateOnly JournalDate,
+        DateTimeOffset? CreatedDateUtc,
+        string SourceType,
+        string Reference,
+        string SourceId,
+        string ContactId,
+        string ContactName,
+        bool IsVoided,
+        string CurrencyCode,
+        decimal CurrencyRate,
+        string PayloadJson,
+        List<ParsedJournalLine> Lines);
     private sealed record ParsedJournalLine(string SourceLineId, string AccountCode, string AccountName, string Description, decimal NetAmount, decimal GrossAmount, decimal TaxAmount, string TrackingJson);
 }
 
@@ -1014,8 +1168,82 @@ public sealed class XeroLedgerSyncWorker(IServiceScopeFactory scopeFactory, ILog
 public sealed class FluxReviewService(AppDbContext db, XeroTenantLedgerService? ledgerService = null)
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+    // P2.20 — per-call cache of the materiality matrix; populated at the start of
+    // RefreshAsync / RebuildAsync, consulted by UpsertFluxGroup. Cat 10.
+    private Dictionary<(Guid OrgId, string StatementType), OrgFluxThresholdConfig> _thresholdMatrix = new();
     private const string MonthOverMonth = "MonthOverMonth";
     private const string YearOverYear = "YearOverYear";
+    // P2.19 — additional comparison bases. Cat 9.
+    private const string YearToDate = "YearToDate";        // current YTD vs prior-year YTD
+    private const string PriorQuarter = "PriorQuarter";    // current month vs same month prior quarter
+    private const string VsBudget = "VsBudget";            // current vs ForecastScenario budget
+
+    /// <summary>P2.20 — load the org's materiality matrix into _thresholdMatrix once per
+    /// flux build call so UpsertFluxGroup can consult it without async hops. Cat 10.</summary>
+    private async Task LoadMaterialityMatrixAsync(Guid organizationId, CancellationToken cancellationToken)
+    {
+        var rows = await db.OrgFluxThresholdConfigs
+            .AsNoTracking()
+            .Where(x => x.OrganizationId == organizationId)
+            .ToListAsync(cancellationToken);
+        _thresholdMatrix = rows.ToDictionary(x => (x.OrganizationId, x.StatementType), x => x);
+    }
+
+    private (decimal Dollar, decimal Percent, string Logic) ResolveDefaultThresholds(Guid organizationId, string statementType)
+    {
+        if (_thresholdMatrix.TryGetValue((organizationId, statementType), out var exact))
+        {
+            return (exact.DollarThreshold, exact.PercentThreshold, exact.ThresholdLogic);
+        }
+        if (_thresholdMatrix.TryGetValue((organizationId, "*"), out var wildcard))
+        {
+            return (wildcard.DollarThreshold, wildcard.PercentThreshold, wildcard.ThresholdLogic);
+        }
+        // Best-in-class fallback: $5k AND 10%. Closes the long-standing default-of-zero bug
+        // that effectively disabled the dollar leg of the dual-threshold gate.
+        return (5_000m, 10m, "AND");
+    }
+
+    /// <summary>P2.19 — derive a budget amount per StatementType|GroupKey for the period
+    /// from the org's base ForecastScenario. The forecast model expresses growth percentages
+    /// rather than absolute line items, so this is a best-effort allocator: we apply the
+    /// scenario's RevenueGrowthPercent / OpexGrowthPercent against the prior-year YTD lines.
+    /// Replace with a richer per-line budget table once that exists.</summary>
+    private async Task<Dictionary<string, decimal>> BuildBudgetByGroupAsync(Guid organizationId, Guid periodId, CancellationToken cancellationToken)
+    {
+        var scenario = await db.ForecastScenarios
+            .AsNoTracking()
+            .FirstOrDefaultAsync(x => x.OrganizationId == organizationId && x.IsBase, cancellationToken);
+        if (scenario is null)
+        {
+            return new(StringComparer.OrdinalIgnoreCase);
+        }
+
+        // Apply the scenario's growth percentages to the most recent prior period's
+        // statement lines as a stand-in budget.
+        var priorPeriodLines = await db.FinancialStatementLines
+            .AsNoTracking()
+            .Where(x => x.OrganizationId == organizationId && x.ReportingPeriodId != periodId)
+            .OrderByDescending(x => x.ReportingPeriodId)
+            .Take(500)
+            .ToListAsync(cancellationToken);
+        if (priorPeriodLines.Count == 0)
+        {
+            return new(StringComparer.OrdinalIgnoreCase);
+        }
+
+        var groups = BuildStatementGroups(priorPeriodLines);
+        var dict = new Dictionary<string, decimal>(StringComparer.OrdinalIgnoreCase);
+        foreach (var g in groups)
+        {
+            var growth = g.StatementType.Equals("ProfitAndLoss", StringComparison.OrdinalIgnoreCase)
+                && g.GroupName.Contains("Revenue", StringComparison.OrdinalIgnoreCase)
+                ? scenario.RevenueGrowthPercent / 100m
+                : scenario.OpexGrowthPercent / 100m;
+            dict[$"{g.StatementType}|{g.GroupKey}"] = Math.Round(g.CurrentAmount * (1m + growth), 2);
+        }
+        return dict;
+    }
 
     public async Task<FluxReviewDto> GetOrBuildAsync(Guid packageId, CancellationToken cancellationToken)
     {
@@ -1034,6 +1262,9 @@ public sealed class FluxReviewService(AppDbContext db, XeroTenantLedgerService? 
     {
         var package = await db.ReportPackages.Include(x => x.ReportingPeriod).FirstAsync(x => x.Id == packageId, cancellationToken);
         var period = package.ReportingPeriod ?? throw new InvalidOperationException("Package period is required.");
+        // P2.20 — pre-load the materiality matrix once so UpsertFluxGroup can apply
+        // org-specific defaults to newly-created flux rows. Cat 10.
+        await LoadMaterialityMatrixAsync(package.OrganizationId, cancellationToken);
         var priorMonthKey = PeriodKey(period.PeriodStart.AddMonths(-1));
         var currentLines = await db.FinancialStatementLines
             .AsNoTracking()
@@ -1071,12 +1302,92 @@ public sealed class FluxReviewService(AppDbContext db, XeroTenantLedgerService? 
         var priorMonthGroups = BuildStatementGroups(priorMonthLines).ToDictionary(x => $"{x.StatementType}|{x.GroupKey}", StringComparer.OrdinalIgnoreCase);
         var threeMonthGroups = BuildStatementGroups(threeMonthLines).ToDictionary(x => $"{x.StatementType}|{x.GroupKey}", StringComparer.OrdinalIgnoreCase);
 
+        // P2.19 — Year-to-Date flux: sum FinancialStatementLines from fiscal-year-start
+        // (assumed Jan 1) through current period, vs prior-year same window. Cat 9.
+        var fyStart = new DateOnly(period.PeriodStart.Year, 1, 1);
+        var ytdPeriodIds = await db.ReportingPeriods
+            .AsNoTracking()
+            .Where(x => x.PeriodStart >= fyStart && x.PeriodStart <= period.PeriodStart)
+            .Select(x => x.Id)
+            .ToListAsync(cancellationToken);
+        var ytdLines = ytdPeriodIds.Count == 0
+            ? new List<FinancialStatementLine>()
+            : await db.FinancialStatementLines
+                .AsNoTracking()
+                .Where(x => x.OrganizationId == package.OrganizationId
+                            && ytdPeriodIds.Contains(x.ReportingPeriodId)
+                            && x.ReportPackageId == null
+                            && (x.StatementType == "ProfitAndLoss" || x.StatementType == "BalanceSheet"))
+                .ToListAsync(cancellationToken);
+        var priorYearFyStart = fyStart.AddYears(-1);
+        var priorYearEnd = period.PeriodStart.AddYears(-1);
+        var priorYtdPeriodIds = await db.ReportingPeriods
+            .AsNoTracking()
+            .Where(x => x.PeriodStart >= priorYearFyStart && x.PeriodStart <= priorYearEnd)
+            .Select(x => x.Id)
+            .ToListAsync(cancellationToken);
+        var priorYtdLines = priorYtdPeriodIds.Count == 0
+            ? new List<FinancialStatementLine>()
+            : await db.FinancialStatementLines
+                .AsNoTracking()
+                .Where(x => x.OrganizationId == package.OrganizationId
+                            && priorYtdPeriodIds.Contains(x.ReportingPeriodId)
+                            && x.ReportPackageId == null
+                            && (x.StatementType == "ProfitAndLoss" || x.StatementType == "BalanceSheet"))
+                .ToListAsync(cancellationToken);
+        var ytdGroups = BuildStatementGroups(ytdLines).ToDictionary(x => $"{x.StatementType}|{x.GroupKey}", StringComparer.OrdinalIgnoreCase);
+        var priorYtdGroups = BuildStatementGroups(priorYtdLines).ToDictionary(x => $"{x.StatementType}|{x.GroupKey}", StringComparer.OrdinalIgnoreCase);
+
+        // P2.19 — Prior-quarter window: same calendar month one quarter ago, summed against
+        // the same month two quarters ago to expose seasonally-adjusted swings the MoM
+        // comparison can't show. Cat 9.
+        var priorQuarterStart = period.PeriodStart.AddMonths(-3);
+        var priorQuarterPeriod = await db.ReportingPeriods.AsNoTracking().FirstOrDefaultAsync(x => x.PeriodStart == priorQuarterStart, cancellationToken);
+        var priorQuarterLines = priorQuarterPeriod is null
+            ? new List<FinancialStatementLine>()
+            : await db.FinancialStatementLines
+                .AsNoTracking()
+                .Where(x => x.OrganizationId == package.OrganizationId
+                            && x.ReportingPeriodId == priorQuarterPeriod.Id
+                            && x.ReportPackageId == null
+                            && (x.StatementType == "ProfitAndLoss" || x.StatementType == "BalanceSheet"))
+                .ToListAsync(cancellationToken);
+        var priorQuarterGroups = BuildStatementGroups(priorQuarterLines).ToDictionary(x => $"{x.StatementType}|{x.GroupKey}", StringComparer.OrdinalIgnoreCase);
+
+        // P2.19 — Vs Budget. Cat 9. Source = ForecastScenario marked IsBase for the period.
+        var budgetByGroup = await BuildBudgetByGroupAsync(package.OrganizationId, period.Id, cancellationToken);
+
         foreach (var group in BuildStatementGroups(currentLines))
         {
             priorMonthGroups.TryGetValue($"{group.StatementType}|{group.GroupKey}", out var priorMonthGroup);
             threeMonthGroups.TryGetValue($"{group.StatementType}|{group.GroupKey}", out var threeMonthGroup);
             UpsertFluxGroup(package, period.Key, priorMonthKey, MonthOverMonth, group, priorMonthGroup?.CurrentAmount ?? 0m, threeMonthGroup?.CurrentAmount ?? group.CurrentAmount, byKey, currentKeys);
             UpsertFluxGroup(package, period.Key, period.PeriodStart.AddYears(-1).ToString("yyyy-MM", CultureInfo.InvariantCulture), YearOverYear, group, group.PriorAmount, 0m, byKey, currentKeys);
+
+            // YearToDate — only emit when the YTD window spans more than the current month
+            // OR there's a prior-year YTD baseline to compare against. In month 1 with no
+            // prior-year data, YTD is mathematically identical to MonthOverMonth and just
+            // adds noise. Cat 9.
+            ytdGroups.TryGetValue($"{group.StatementType}|{group.GroupKey}", out var currentYtd);
+            priorYtdGroups.TryGetValue($"{group.StatementType}|{group.GroupKey}", out var priorYtd);
+            var ytdWindowExceedsOneMonth = ytdPeriodIds.Count > 1;
+            var hasPriorYtdBaseline = priorYtdLines.Count > 0;
+            if (currentYtd is not null && (ytdWindowExceedsOneMonth || hasPriorYtdBaseline))
+            {
+                UpsertFluxGroup(package, period.Key, $"YTD-{period.PeriodStart.AddYears(-1).Year}", YearToDate, currentYtd, priorYtd?.CurrentAmount ?? 0m, 0m, byKey, currentKeys);
+            }
+
+            // VsBudget
+            if (budgetByGroup.TryGetValue($"{group.StatementType}|{group.GroupKey}", out var budgetAmount))
+            {
+                UpsertFluxGroup(package, period.Key, "Budget", VsBudget, group, budgetAmount, 0m, byKey, currentKeys);
+            }
+
+            // PriorQuarter — only emit when there's an actual prior-quarter baseline period.
+            if (priorQuarterGroups.TryGetValue($"{group.StatementType}|{group.GroupKey}", out var pqGroup))
+            {
+                UpsertFluxGroup(package, period.Key, priorQuarterStart.ToString("yyyy-MM", CultureInfo.InvariantCulture), PriorQuarter, group, pqGroup.CurrentAmount, 0m, byKey, currentKeys);
+            }
         }
 
         await UpsertUngroupedAccountFluxGroupsAsync(package, period, priorMonthKey, byKey, currentKeys, cancellationToken);
@@ -1447,19 +1758,178 @@ public sealed class FluxReviewService(AppDbContext db, XeroTenantLedgerService? 
     {
         var group = await db.FluxReviewGroups.AsNoTracking().FirstAsync(x => x.Id == groupId, cancellationToken);
         var drilldown = await GetDrilldownAsync(groupId, cancellationToken);
+
+        // P2.21 — vendor frequency labels (deterministic, not AI-inferred). Cat 14.
+        var vendorContext = await BuildVendorContextAsync(group, cancellationToken);
+        // P2.22 — cadence label from existing TrendJson. Cat 15.
+        var cadenceLabel = ComputeCadenceLabel(group.TrendJson);
+        // P2.24 — source-type breakdown so the AI can isolate MANJOURNAL / accrual reversal
+        // contributions to the variance instead of misattributing them. Cat 17.
+        var sourceTypeBreakdown = await BuildSourceTypeBreakdownAsync(group, cancellationToken);
+
         return JsonSerializer.Serialize(new
         {
             group = FluxReviewGroupDto.From(group),
             drilldown,
+            vendorContext,           // [{ name, status: established|new|anomalous, priorMonthsActive, currentAmount }]
+            cadenceLabel,            // "Recurring" | "OneTime" | "Reversal" | "Irregular"
+            sourceTypeBreakdown,     // { MANJOURNAL: 12345.67, ACCREC: -2300, ... }
+            // P2.23 — instruct the model to return ranked hypotheses with per-line citations.
             instructions = new[]
             {
-                "Explain the variance in plain financial-review language.",
-                "Use the current period, prior period, account-level changes, and transaction evidence supplied here.",
-                "Do not mention missing credentials, tokens, or any data outside this JSON snapshot.",
-                "Return a concise explanation that a finance reviewer can approve or edit."
+                "Explain the variance in plain financial-review language using ONLY the data in this JSON snapshot.",
+                "Cite specific journalLineIds for every claim — every evidence[] entry MUST include the journalLineId field copied verbatim from drilldown.currentTransactions or drilldown.priorTransactions.",
+                "Use the supplied vendorContext labels and cadenceLabel directly; do not invent vendor classifications.",
+                "If sourceTypeBreakdown shows non-zero MANJOURNAL contribution, treat that portion separately as a manual / reclass adjustment.",
+                "Return a ranked hypotheses[] array, most-likely first, each with rank, label, confidence in [0,1], and journalLineIds[] backing it.",
+                "Do not mention missing credentials, tokens, or any data outside this JSON snapshot."
             },
             allowedOperations = new[] { "set_flux_explanation" }
         }, JsonOptions);
+    }
+
+    /// <summary>P2.21 — compute deterministic vendor labels from cross-period contact frequency.</summary>
+    private async Task<IReadOnlyList<object>> BuildVendorContextAsync(FluxReviewGroup group, CancellationToken cancellationToken)
+    {
+        var package = await db.ReportPackages
+            .AsNoTracking()
+            .Include(x => x.ReportingPeriod)
+            .FirstOrDefaultAsync(x => x.Id == group.ReportPackageId, cancellationToken);
+        if (package?.ReportingPeriod is null)
+        {
+            return [];
+        }
+
+        var periodStart = package.ReportingPeriod.PeriodStart;
+        var periodEnd = package.ReportingPeriod.PeriodEnd;
+        var lookbackStart = periodStart.AddMonths(-11);
+
+        // Match journals belonging to accounts in this flux group (best-effort: use the
+        // group's GroupKey as an account-code hint when present, otherwise span all
+        // journals for the tenant in the period).
+        var accountCodes = new[] { group.GroupKey }
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .ToArray();
+
+        var contactStats = await db.XeroJournals
+            .AsNoTracking()
+            .Where(j => j.JournalDate >= lookbackStart && j.JournalDate <= periodEnd && !string.IsNullOrWhiteSpace(j.ContactName)
+                        && (accountCodes.Length == 0 || j.Lines.Any(l => accountCodes.Contains(l.AccountCode))))
+            .GroupBy(j => j.ContactName)
+            .Select(g => new
+            {
+                Name = g.Key,
+                MonthsActive = g.Select(x => x.JournalDate.Year * 12 + x.JournalDate.Month).Distinct().Count(),
+                LatestActivity = g.Max(x => x.JournalDate),
+                CurrentAmount = g.Where(x => x.JournalDate >= periodStart && x.JournalDate <= periodEnd)
+                    .SelectMany(x => x.Lines.Where(l => accountCodes.Length == 0 || accountCodes.Contains(l.AccountCode)))
+                    .Sum(l => l.NetAmount)
+            })
+            .ToListAsync(cancellationToken);
+
+        return contactStats
+            .OrderByDescending(x => Math.Abs(x.CurrentAmount))
+            .Take(8)
+            .Select(x => (object)new
+            {
+                name = x.Name,
+                status = x.MonthsActive >= 6 ? "established" : (x.MonthsActive == 1 ? "new" : "anomalous"),
+                priorMonthsActive = Math.Max(0, x.MonthsActive - 1),
+                latestActivity = x.LatestActivity.ToString("yyyy-MM-dd"),
+                currentAmount = x.CurrentAmount
+            })
+            .ToArray();
+    }
+
+    /// <summary>P2.22 — derive a cadence label from the existing 6-month TrendJson.</summary>
+    private static string ComputeCadenceLabel(string trendJson)
+    {
+        if (string.IsNullOrWhiteSpace(trendJson))
+        {
+            return "Irregular";
+        }
+        decimal[] amounts;
+        try
+        {
+            using var doc = JsonDocument.Parse(trendJson);
+            amounts = doc.RootElement.EnumerateArray()
+                .Select(p => p.TryGetProperty("amount", out var a) && a.TryGetDecimal(out var v) ? v : 0m)
+                .ToArray();
+        }
+        catch
+        {
+            return "Irregular";
+        }
+        if (amounts.Length == 0)
+        {
+            return "Irregular";
+        }
+        var nonZero = amounts.Where(x => x != 0m).ToArray();
+        if (nonZero.Length == 0)
+        {
+            return "Irregular";
+        }
+        // Reversal: two consecutive entries that net to ~0 (≤1% of either side)
+        for (var i = 1; i < amounts.Length; i++)
+        {
+            var sum = amounts[i] + amounts[i - 1];
+            var basis = Math.Max(Math.Abs(amounts[i]), Math.Abs(amounts[i - 1]));
+            if (basis > 0 && Math.Abs(sum) / basis <= 0.01m)
+            {
+                return "Reversal";
+            }
+        }
+        if (nonZero.Length == 1)
+        {
+            return "OneTime";
+        }
+        // Recurring: nonZero in ≥ 5 of 6 months and coefficient of variation ≤ 0.30
+        if (nonZero.Length >= Math.Min(5, amounts.Length))
+        {
+            var mean = nonZero.Average();
+            if (mean != 0m)
+            {
+                var variance = nonZero.Average(x => (double)((x - mean) * (x - mean)));
+                var stddev = (decimal)Math.Sqrt(variance);
+                var cv = mean == 0m ? 999m : Math.Abs(stddev / mean);
+                if (cv <= 0.30m)
+                {
+                    return "Recurring";
+                }
+            }
+        }
+        return "Irregular";
+    }
+
+    /// <summary>P2.24 — sum journal-line NetAmount by SourceType for journals contributing
+    /// to this flux group's accounts in the current period.</summary>
+    private async Task<Dictionary<string, decimal>> BuildSourceTypeBreakdownAsync(FluxReviewGroup group, CancellationToken cancellationToken)
+    {
+        var package = await db.ReportPackages
+            .AsNoTracking()
+            .Include(x => x.ReportingPeriod)
+            .FirstOrDefaultAsync(x => x.Id == group.ReportPackageId, cancellationToken);
+        if (package?.ReportingPeriod is null)
+        {
+            return new();
+        }
+
+        var accountCodes = new[] { group.GroupKey }
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .ToArray();
+
+        var rows = await db.XeroJournalLines
+            .AsNoTracking()
+            .Where(l => (accountCodes.Length == 0 || accountCodes.Contains(l.AccountCode))
+                        && l.XeroJournal!.JournalDate >= package.ReportingPeriod.PeriodStart
+                        && l.XeroJournal.JournalDate <= package.ReportingPeriod.PeriodEnd)
+            .Select(l => new { l.XeroJournal!.SourceType, l.XeroJournal.IsVoided, l.NetAmount })
+            .ToListAsync(cancellationToken);
+
+        return rows
+            .Where(x => !x.IsVoided)
+            .GroupBy(x => string.IsNullOrWhiteSpace(x.SourceType) ? "UNKNOWN" : x.SourceType.ToUpperInvariant())
+            .ToDictionary(g => g.Key, g => g.Sum(x => x.NetAmount));
     }
 
     private async Task<FluxReviewDto> BuildDtoAsync(Guid packageId, CancellationToken cancellationToken)
@@ -1501,6 +1971,11 @@ public sealed class FluxReviewService(AppDbContext db, XeroTenantLedgerService? 
         currentKeys.Add(lookupKey);
         if (!byKey.TryGetValue(lookupKey, out var reviewGroup))
         {
+            // P2.20 — sensible defaults from the materiality matrix (resolved at Refresh-time
+            // and cached on the service via _thresholdMatrix). Falls back to the new
+            // best-in-class defaults of $5k AND 10% — the prior 0 / OR effectively disabled
+            // the dollar leg of the dual-threshold gate. Cat 10.
+            var (defaultDollar, defaultPercent, defaultLogic) = ResolveDefaultThresholds(package.OrganizationId, group.StatementType);
             reviewGroup = new FluxReviewGroup
             {
                 Id = Guid.NewGuid(),
@@ -1511,9 +1986,9 @@ public sealed class FluxReviewService(AppDbContext db, XeroTenantLedgerService? 
                 StatementType = group.StatementType,
                 GroupKey = group.GroupKey,
                 GroupName = group.GroupName,
-                DollarThreshold = 0m,
-                PercentThreshold = 10m,
-                ThresholdLogic = "OR",
+                DollarThreshold = defaultDollar,
+                PercentThreshold = defaultPercent,
+                ThresholdLogic = defaultLogic,
                 CreatedAt = DateTimeOffset.UtcNow
             };
             byKey[lookupKey] = reviewGroup;
@@ -1521,8 +1996,6 @@ public sealed class FluxReviewService(AppDbContext db, XeroTenantLedgerService? 
         }
 
         var changed = reviewGroup.SourceDataHash != "" && reviewGroup.SourceDataHash != sourceHash;
-        reviewGroup.DollarThreshold = reviewGroup.DollarThreshold == 10_000m ? 0m : reviewGroup.DollarThreshold;
-        reviewGroup.PercentThreshold = reviewGroup.PercentThreshold == 0m ? 10m : reviewGroup.PercentThreshold;
         reviewGroup.ThresholdLogic = string.Equals(reviewGroup.ThresholdLogic, "AND", StringComparison.OrdinalIgnoreCase) ? "AND" : "OR";
         reviewGroup.CurrentPeriodKey = currentPeriodKey;
         reviewGroup.PriorPeriodKey = priorPeriodKey;
@@ -2049,44 +2522,58 @@ public sealed class FluxReviewService(AppDbContext db, XeroTenantLedgerService? 
     private sealed record StatementGroup(string StatementType, string GroupKey, string GroupName, decimal CurrentAmount, decimal PriorAmount, List<FinancialStatementLine> Lines);
 }
 
-public sealed class AiPackageDraftService(AppDbContext db)
+public sealed class AiPackageDraftService(AppDbContext db, PackageDiffService diffService)
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
     public async Task<IReadOnlyList<AiPackageDraftSuggestion>> CreateDraftsAsync(Guid packageId, CancellationToken cancellationToken)
     {
-        var package = await db.ReportPackages.Include(x => x.Slides).FirstAsync(x => x.Id == packageId, cancellationToken);
-        var slideId = package.Slides.OrderBy(x => x.SortOrder).FirstOrDefault()?.Id;
-        var fluxGroups = (await db.FluxReviewGroups
+        // Marquee feature: consume the prior-month baseline diff so suggestions are typed
+        // (Keep / Modify / Add / Remove) and filtered through the board materiality
+        // threshold rather than firing top-8 by absolute variance regardless of context.
+        // Cat 19, 20.
+        var diff = await diffService.ComputeAsync(packageId, cancellationToken);
+
+        var package = await db.ReportPackages
+            .Include(x => x.Slides)
+            .FirstAsync(x => x.Id == packageId, cancellationToken);
+        var anchorSlideId = package.Slides.OrderBy(x => x.SortOrder).FirstOrDefault()?.Id;
+
+        // Pull flux explanations to enrich Add/Modify suggestions where a current flux group
+        // has prepared narrative.
+        var fluxLookup = await db.FluxReviewGroups
             .AsNoTracking()
-            .Where(x => x.ReportPackageId == packageId && !string.IsNullOrWhiteSpace(x.Explanation))
-            .ToListAsync(cancellationToken))
-            .OrderByDescending(x => Math.Abs(x.VarianceAmount))
-            .Take(8)
-            .ToList();
+            .Where(x => x.ReportPackageId == packageId)
+            .ToDictionaryAsync(x => x.Id, cancellationToken);
 
         var created = new List<AiPackageDraftSuggestion>();
-        foreach (var group in fluxGroups)
+
+        foreach (var decision in diff.Decisions)
         {
+            var (kind, title, body) = BuildSuggestionContent(decision, fluxLookup);
             var suggestion = new AiPackageDraftSuggestion
             {
                 Id = Guid.NewGuid(),
                 ReportPackageId = packageId,
-                Kind = "FluxContext",
-                Title = $"Add context for {group.GroupName}",
-                Description = group.Explanation,
+                Kind = kind,
+                Title = title,
+                Description = body,
                 PayloadJson = JsonSerializer.Serialize(new
                 {
-                    operation = "add_context_block",
-                    slideId,
-                    kind = "callout",
-                    content = new
-                    {
-                        title = group.GroupName,
-                        body = group.Explanation,
-                        variance = group.VarianceAmount,
-                        variancePercent = group.VariancePercent
-                    }
+                    operation = MapOperation(decision.Kind),
+                    decisionKind = decision.Kind.ToString(),
+                    priorSlideId = decision.PriorSlideId,
+                    currentSlideId = decision.CurrentSlideId ?? anchorSlideId,
+                    fluxGroupId = decision.CurrentFluxGroupId,
+                    subject = decision.Subject,
+                    variance = decision.VarianceAmount,
+                    variancePercent = decision.VariancePercent,
+                    currentValue = decision.CurrentValue,
+                    priorValue = decision.PriorValue,
+                    rationale = decision.Rationale,
+                    boardDollarThreshold = diff.BoardDollarThreshold,
+                    boardPercentThreshold = diff.BoardPercentThreshold,
+                    priorPackageId = diff.PriorPackageId
                 }, JsonOptions)
             };
             db.AiPackageDraftSuggestions.Add(suggestion);
@@ -2095,13 +2582,20 @@ public sealed class AiPackageDraftService(AppDbContext db)
 
         if (created.Count == 0)
         {
+            // Fallback only when the diff produced zero decisions (e.g. brand-new org with
+            // no prior package and no material flux yet). Surface a "ready to start" hint
+            // instead of silence.
             var suggestion = new AiPackageDraftSuggestion
             {
                 Id = Guid.NewGuid(),
                 ReportPackageId = packageId,
                 Kind = "Readiness",
-                Title = "Complete flux review before AI package drafting",
-                Description = "No approved flux explanations are available yet. Complete flux review to provide package context.",
+                Title = diff.PriorPackageId is null
+                    ? "First package — no prior baseline to diff against"
+                    : "No material movements above the board threshold this period",
+                Description = diff.PriorPackageId is null
+                    ? "This is the first package for this organization. The AI baseline diff requires at least one prior package to produce keep/modify/add/remove suggestions."
+                    : $"All movements were below the board materiality threshold (${diff.BoardDollarThreshold:N0} AND {diff.BoardPercentThreshold:0.#}%). The package can be carried forward as-is.",
                 PayloadJson = JsonSerializer.Serialize(new { operation = "context_only" }, JsonOptions)
             };
             db.AiPackageDraftSuggestions.Add(suggestion);
@@ -2111,6 +2605,39 @@ public sealed class AiPackageDraftService(AppDbContext db)
         await db.SaveChangesAsync(cancellationToken);
         return created;
     }
+
+    private static (string Kind, string Title, string Body) BuildSuggestionContent(
+        PackageDiffService.SlideDecision decision,
+        IReadOnlyDictionary<Guid, FluxReviewGroup> fluxLookup)
+    {
+        var fluxNarrative = decision.CurrentFluxGroupId is { } fluxId
+                            && fluxLookup.TryGetValue(fluxId, out var flux)
+                            && !string.IsNullOrWhiteSpace(flux.Explanation)
+            ? $"\n\nCurrent flux explanation: {flux.Explanation}"
+            : "";
+
+        return decision.Kind switch
+        {
+            PackageDiffService.SlideDecisionKind.Keep =>
+                ("Keep", $"Carry forward — {decision.Subject}", decision.Rationale),
+            PackageDiffService.SlideDecisionKind.Modify =>
+                ("Modify", $"Update narrative — {decision.Subject}", decision.Rationale + fluxNarrative),
+            PackageDiffService.SlideDecisionKind.Add =>
+                ("Add", $"New material item — {decision.Subject}", decision.Rationale + fluxNarrative),
+            PackageDiffService.SlideDecisionKind.Remove =>
+                ("Remove", $"Consider removing — {decision.Subject}", decision.Rationale),
+            _ => ("Other", decision.Subject, decision.Rationale)
+        };
+    }
+
+    private static string MapOperation(PackageDiffService.SlideDecisionKind kind) => kind switch
+    {
+        PackageDiffService.SlideDecisionKind.Keep => "keep_slide",
+        PackageDiffService.SlideDecisionKind.Modify => "update_slide_narrative",
+        PackageDiffService.SlideDecisionKind.Add => "add_slide",
+        PackageDiffService.SlideDecisionKind.Remove => "remove_slide",
+        _ => "context_only"
+    };
 
     public async Task<IReadOnlyList<AiPackageDraftSuggestion>> GetDraftsAsync(Guid packageId, CancellationToken cancellationToken)
     {
@@ -2131,17 +2658,51 @@ public sealed class AiPackageDraftService(AppDbContext db)
 
         var root = JsonNode.Parse(draft.PayloadJson);
         var operation = root?["operation"]?.GetValue<string>();
-        if (operation == "add_context_block" && Guid.TryParse(root?["slideId"]?.GetValue<string>(), out var slideId))
+        switch (operation)
         {
-            var maxSort = await db.SlideBlocks.Where(x => x.PackageSlideId == slideId).Select(x => (int?)x.SortOrder).MaxAsync(cancellationToken) ?? 0;
-            db.SlideBlocks.Add(new SlideBlock
-            {
-                Id = Guid.NewGuid(),
-                PackageSlideId = slideId,
-                SortOrder = maxSort + 1,
-                Kind = root?["kind"]?.GetValue<string>() ?? "callout",
-                ContentJson = root?["content"]?.ToJsonString() ?? "{}"
-            });
+            case "add_context_block":
+                // Legacy operation, retained for compatibility with previously-staged drafts
+                // that pre-date the diff engine.
+                if (Guid.TryParse(root?["slideId"]?.GetValue<string>(), out var legacySlideId))
+                {
+                    await AddCalloutBlockAsync(legacySlideId, root?["content"]?.ToJsonString() ?? "{}", root?["kind"]?.GetValue<string>() ?? "callout", cancellationToken);
+                }
+                break;
+
+            case "add_slide":
+                // Diff engine emitted Add: create a new slide on the package for the subject,
+                // then attach a callout block summarising why it was material.
+                await AddNewSlideFromDecisionAsync(draft.ReportPackageId, root, cancellationToken);
+                break;
+
+            case "update_slide_narrative":
+                // Diff engine emitted Modify: append a narrative callout to the existing slide
+                // identified by currentSlideId or fallback to the package's first slide.
+                var modifySlideId = ResolveSlideIdFromDecision(root) ?? await FirstSlideIdAsync(draft.ReportPackageId, cancellationToken);
+                if (modifySlideId is { } targetSlide)
+                {
+                    var content = JsonSerializer.Serialize(new
+                    {
+                        title = root?["subject"]?.GetValue<string>() ?? draft.Title,
+                        body = root?["rationale"]?.GetValue<string>() ?? draft.Description,
+                        variance = root?["variance"]?.GetValue<decimal>() ?? 0m,
+                        variancePercent = root?["variancePercent"]?.GetValue<decimal>() ?? 0m,
+                        decisionKind = "Modify"
+                    }, JsonOptions);
+                    await AddCalloutBlockAsync(targetSlide, content, "callout", cancellationToken);
+                }
+                break;
+
+            case "keep_slide":
+                // Carry-forward decision — narrative on the prior slide stays. No DB change
+                // beyond marking the suggestion Accepted is needed.
+                break;
+
+            case "remove_slide":
+                // The CFO has explicitly accepted "remove" guidance, but we don't auto-delete
+                // a prior slide here — slides are mutated through the slide editor. The
+                // accepted decision serves as a signed audit record that removal was approved.
+                break;
         }
 
         draft.Status = "Accepted";
@@ -2157,6 +2718,84 @@ public sealed class AiPackageDraftService(AppDbContext db)
         });
         await db.SaveChangesAsync(cancellationToken);
         return draft;
+    }
+
+    private async Task AddCalloutBlockAsync(Guid slideId, string contentJson, string kind, CancellationToken cancellationToken, Guid? originatingAiRunId = null)
+    {
+        var maxSort = await db.SlideBlocks
+            .Where(x => x.PackageSlideId == slideId)
+            .Select(x => (int?)x.SortOrder)
+            .MaxAsync(cancellationToken) ?? 0;
+        db.SlideBlocks.Add(new SlideBlock
+        {
+            Id = Guid.NewGuid(),
+            PackageSlideId = slideId,
+            SortOrder = maxSort + 1,
+            Kind = kind,
+            ContentJson = contentJson,
+            // P1.17 — AI provenance. Cat 25.
+            IsAiAuthored = true,
+            OriginatingAiRunId = originatingAiRunId,
+            AiAuthoredAt = DateTimeOffset.UtcNow
+        });
+    }
+
+    private async Task AddNewSlideFromDecisionAsync(Guid packageId, JsonNode? decisionPayload, CancellationToken cancellationToken)
+    {
+        var subject = decisionPayload?["subject"]?.GetValue<string>() ?? "New material item";
+        var maxSort = await db.PackageSlides
+            .Where(x => x.ReportPackageId == packageId)
+            .Select(x => (int?)x.SortOrder)
+            .MaxAsync(cancellationToken) ?? 0;
+
+        var newSlide = new PackageSlide
+        {
+            Id = Guid.NewGuid(),
+            ReportPackageId = packageId,
+            SortOrder = maxSort + 1,
+            Subject = subject,
+            KpiLabel = subject,
+            CurrentValue = decisionPayload?["currentValue"]?.GetValue<decimal>() ?? 0m,
+            PriorValue = decisionPayload?["priorValue"]?.GetValue<decimal>() ?? 0m,
+            VarianceAmount = decisionPayload?["variance"]?.GetValue<decimal>() ?? 0m,
+            VariancePercent = decisionPayload?["variancePercent"]?.GetValue<decimal>() ?? 0m
+        };
+        db.PackageSlides.Add(newSlide);
+
+        var content = JsonSerializer.Serialize(new
+        {
+            title = subject,
+            body = decisionPayload?["rationale"]?.GetValue<string>() ?? "",
+            variance = newSlide.VarianceAmount,
+            variancePercent = newSlide.VariancePercent,
+            decisionKind = "Add"
+        }, JsonOptions);
+        db.SlideBlocks.Add(new SlideBlock
+        {
+            Id = Guid.NewGuid(),
+            PackageSlideId = newSlide.Id,
+            SortOrder = 1,
+            Kind = "callout",
+            ContentJson = content,
+            // P1.17 — AI provenance on the freshly-created callout. Cat 25.
+            IsAiAuthored = true,
+            AiAuthoredAt = DateTimeOffset.UtcNow
+        });
+    }
+
+    private static Guid? ResolveSlideIdFromDecision(JsonNode? root)
+    {
+        var raw = root?["currentSlideId"]?.GetValue<string>();
+        return Guid.TryParse(raw, out var id) ? id : null;
+    }
+
+    private async Task<Guid?> FirstSlideIdAsync(Guid packageId, CancellationToken cancellationToken)
+    {
+        return await db.PackageSlides
+            .Where(x => x.ReportPackageId == packageId)
+            .OrderBy(x => x.SortOrder)
+            .Select(x => (Guid?)x.Id)
+            .FirstOrDefaultAsync(cancellationToken);
     }
 
     public async Task<AiPackageDraftSuggestion> RejectAsync(Guid draftId, string? reason, CancellationToken cancellationToken)

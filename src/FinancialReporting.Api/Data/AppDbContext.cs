@@ -3,8 +3,15 @@ using Microsoft.EntityFrameworkCore;
 
 namespace FinancialReporting.Api.Data;
 
-public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(options)
+public sealed class AppDbContext(DbContextOptions<AppDbContext> options, IOrganizationContext? orgContext = null) : DbContext(options)
 {
+    // P3.30 — captured once per DbContext instance; EF re-evaluates property accesses on
+    // each query, so a request-scoped IOrganizationContext that returns the current tenant
+    // claim will scope every query automatically. Cat 45.
+    // Non-null fallback because EF query filters can't short-circuit on instance-null at
+    // runtime — they evaluate the property access regardless and would NRE.
+    private readonly IOrganizationContext _orgContext = orgContext ?? new NullOrganizationContext();
+
     public DbSet<Organization> Organizations => Set<Organization>();
     public DbSet<ReportingPeriod> ReportingPeriods => Set<ReportingPeriod>();
     public DbSet<ReportPackage> ReportPackages => Set<ReportPackage>();
@@ -38,6 +45,9 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
     public DbSet<StatementRun> StatementRuns => Set<StatementRun>();
     public DbSet<StatementQaResult> StatementQaResults => Set<StatementQaResult>();
     public DbSet<XeroOAuthSession> XeroOAuthSessions => Set<XeroOAuthSession>();
+    public DbSet<XeroChartOfAccount> XeroChartOfAccounts => Set<XeroChartOfAccount>();
+    public DbSet<XeroContact> XeroContacts => Set<XeroContact>();
+    public DbSet<OrgFluxThresholdConfig> OrgFluxThresholdConfigs => Set<OrgFluxThresholdConfig>();
     public DbSet<GlAccount> GlAccounts => Set<GlAccount>();
     public DbSet<GlTransaction> GlTransactions => Set<GlTransaction>();
     public DbSet<FluxReviewGroup> FluxReviewGroups => Set<FluxReviewGroup>();
@@ -85,6 +95,9 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
         modelBuilder.Entity<StatementRun>().HasIndex(x => new { x.OrganizationId, x.ReportingPeriodId, x.TenantId });
         modelBuilder.Entity<StatementQaResult>().HasIndex(x => x.ReportPackageId);
         modelBuilder.Entity<GlAccount>().HasIndex(x => new { x.OrganizationId, x.ReportingPeriodId, x.TenantId, x.Code }).IsUnique();
+        modelBuilder.Entity<XeroChartOfAccount>().HasIndex(x => new { x.TenantId, x.Code }).IsUnique();
+        modelBuilder.Entity<XeroContact>().HasIndex(x => new { x.TenantId, x.ContactId }).IsUnique();
+        modelBuilder.Entity<OrgFluxThresholdConfig>().HasIndex(x => new { x.OrganizationId, x.StatementType, x.AccountClass }).IsUnique();
         modelBuilder.Entity<FluxReviewGroup>().HasIndex(x => new { x.ReportPackageId, x.FluxType, x.StatementType, x.GroupKey }).IsUnique();
         modelBuilder.Entity<AccountMapping>().HasIndex(x => new { x.OrganizationId, x.ReportingPeriodId, x.FsLine });
         modelBuilder.Entity<FsLineDefinition>().HasIndex(x => new { x.OrganizationId, x.StatementType, x.Name }).IsUnique();
@@ -107,5 +120,33 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
             property.SetPrecision(18);
             property.SetScale(2);
         }
+
+        // P3.30 — global query filters scoped to the active organization. Filters are a
+        // no-op when CurrentOrganizationId is null (Development bypass). When a real auth
+        // context is wired, filters automatically enforce tenant isolation everywhere.
+        // Cat 45.
+        modelBuilder.Entity<ReportPackage>().HasQueryFilter(x => _orgContext.CurrentOrganizationId == null || x.OrganizationId == _orgContext.CurrentOrganizationId);
+        modelBuilder.Entity<KpiDefinition>().HasQueryFilter(x => _orgContext.CurrentOrganizationId == null || x.OrganizationId == _orgContext.CurrentOrganizationId);
+        modelBuilder.Entity<NonFinancialMetric>().HasQueryFilter(x => _orgContext.CurrentOrganizationId == null || x.OrganizationId == _orgContext.CurrentOrganizationId);
+        modelBuilder.Entity<ForecastScenario>().HasQueryFilter(x => _orgContext.CurrentOrganizationId == null || x.OrganizationId == _orgContext.CurrentOrganizationId);
+        modelBuilder.Entity<FxRate>().HasQueryFilter(x => _orgContext.CurrentOrganizationId == null || x.OrganizationId == _orgContext.CurrentOrganizationId);
+        modelBuilder.Entity<XeroConnection>().HasQueryFilter(x => _orgContext.CurrentOrganizationId == null || x.OrganizationId == _orgContext.CurrentOrganizationId);
+        modelBuilder.Entity<XeroTenantEntityMapping>().HasQueryFilter(x => _orgContext.CurrentOrganizationId == null || x.OrganizationId == _orgContext.CurrentOrganizationId);
+        modelBuilder.Entity<XeroSyncRun>().HasQueryFilter(x => _orgContext.CurrentOrganizationId == null || x.OrganizationId == _orgContext.CurrentOrganizationId);
+        modelBuilder.Entity<XeroLedgerMonthlySummary>().HasQueryFilter(x => _orgContext.CurrentOrganizationId == null || x.OrganizationId == _orgContext.CurrentOrganizationId);
+        modelBuilder.Entity<XeroRawReportSnapshot>().HasQueryFilter(x => _orgContext.CurrentOrganizationId == null || x.OrganizationId == _orgContext.CurrentOrganizationId);
+        modelBuilder.Entity<XeroTrialBalanceSnapshot>().HasQueryFilter(x => _orgContext.CurrentOrganizationId == null || x.OrganizationId == _orgContext.CurrentOrganizationId);
+        modelBuilder.Entity<XeroLedgerReconciliationRun>().HasQueryFilter(x => _orgContext.CurrentOrganizationId == null || x.OrganizationId == _orgContext.CurrentOrganizationId);
+        modelBuilder.Entity<XeroBackfillTenantTask>().HasQueryFilter(x => _orgContext.CurrentOrganizationId == null || x.OrganizationId == _orgContext.CurrentOrganizationId);
+        modelBuilder.Entity<FinancialStatementLine>().HasQueryFilter(x => _orgContext.CurrentOrganizationId == null || x.OrganizationId == _orgContext.CurrentOrganizationId);
+        modelBuilder.Entity<StatementRun>().HasQueryFilter(x => _orgContext.CurrentOrganizationId == null || x.OrganizationId == _orgContext.CurrentOrganizationId);
+        modelBuilder.Entity<XeroOAuthSession>().HasQueryFilter(x => _orgContext.CurrentOrganizationId == null || x.OrganizationId == _orgContext.CurrentOrganizationId);
+        modelBuilder.Entity<GlAccount>().HasQueryFilter(x => _orgContext.CurrentOrganizationId == null || x.OrganizationId == _orgContext.CurrentOrganizationId);
+        modelBuilder.Entity<FluxReviewGroup>().HasQueryFilter(x => _orgContext.CurrentOrganizationId == null || x.OrganizationId == _orgContext.CurrentOrganizationId);
+        modelBuilder.Entity<AccountMapping>().HasQueryFilter(x => _orgContext.CurrentOrganizationId == null || x.OrganizationId == _orgContext.CurrentOrganizationId);
+        modelBuilder.Entity<FsLineDefinition>().HasQueryFilter(x => _orgContext.CurrentOrganizationId == null || x.OrganizationId == _orgContext.CurrentOrganizationId);
+        modelBuilder.Entity<EliminationEntry>().HasQueryFilter(x => _orgContext.CurrentOrganizationId == null || x.OrganizationId == _orgContext.CurrentOrganizationId);
+        modelBuilder.Entity<RecurringEliminationRule>().HasQueryFilter(x => _orgContext.CurrentOrganizationId == null || x.OrganizationId == _orgContext.CurrentOrganizationId);
+        modelBuilder.Entity<OrgFluxThresholdConfig>().HasQueryFilter(x => _orgContext.CurrentOrganizationId == null || x.OrganizationId == _orgContext.CurrentOrganizationId);
     }
 }

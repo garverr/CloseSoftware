@@ -13,6 +13,9 @@ using FinancialReporting.Api.Hubs;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
+using QuestPDF.Fluent;
+using QuestPDF.Helpers;
+using QuestPDF.Infrastructure;
 
 namespace FinancialReporting.Api.Services;
 
@@ -768,6 +771,10 @@ public sealed class CodexWorker(
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        // P3.35 — startup recovery: any AiRun left in Running by a previous crash would
+        // never be re-attempted because ProcessNextAsync only picks up Queued rows. Cat 37.
+        await RecoverOrphanedRunsAsync(stoppingToken);
+
         while (!stoppingToken.IsCancellationRequested)
         {
             try
@@ -784,6 +791,32 @@ public sealed class CodexWorker(
             }
 
             await Task.Delay(TimeSpan.FromSeconds(2), stoppingToken);
+        }
+    }
+
+    private async Task RecoverOrphanedRunsAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var scope = scopeFactory.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var orphans = await db.AiRuns
+                .Where(x => x.Status == AiRunStatus.Running)
+                .ToListAsync(cancellationToken);
+            foreach (var run in orphans)
+            {
+                run.Status = AiRunStatus.Queued;
+                run.Logs += "\nReset from Running to Queued during worker startup recovery.";
+            }
+            if (orphans.Count > 0)
+            {
+                await db.SaveChangesAsync(cancellationToken);
+                logger.LogWarning("Codex worker recovered {Count} orphaned Running run(s) on startup.", orphans.Count);
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Codex worker startup recovery failed.");
         }
     }
 
@@ -852,7 +885,9 @@ public sealed class CodexWorker(
         }
 
         await db.SaveChangesAsync(cancellationToken);
-        await hub.Clients.All.SendAsync("aiRunUpdated", AiRunDto.From(run), cancellationToken);
+        // P3.35 — scope SignalR sends to subscribers of THIS run, not every connected client.
+        // Cat 34. Clients call AiHub.SubscribeToRun(runId) when they open a run's UI.
+        await hub.Clients.Group(AiHub.GroupName(run.Id)).SendAsync("aiRunUpdated", AiRunDto.From(run), cancellationToken);
     }
 
     private async Task UpdateRunProgressAsync(AppDbContext db, AiRun run, int progress, string message, CancellationToken cancellationToken)
@@ -860,7 +895,7 @@ public sealed class CodexWorker(
         run.Progress = Math.Max(run.Progress, progress);
         run.Logs += $"\n{message}";
         await db.SaveChangesAsync(cancellationToken);
-        await hub.Clients.All.SendAsync("aiRunUpdated", AiRunDto.From(run), cancellationToken);
+        await hub.Clients.Group(AiHub.GroupName(run.Id)).SendAsync("aiRunUpdated", AiRunDto.From(run), cancellationToken);
     }
 
     private static async Task<string> MockCodexOutputAsync(AiRun run, CancellationToken cancellationToken)
@@ -935,7 +970,28 @@ public sealed class CodexWorker(
 
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeoutCts.CancelAfter(TimeSpan.FromMinutes(configuration.GetValue("Ai:TimeoutMinutes", 8)));
-        await process.WaitForExitAsync(timeoutCts.Token);
+        try
+        {
+            await process.WaitForExitAsync(timeoutCts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            // P3.35 — kill the live process tree on cancel/timeout. Without this the Codex
+            // subprocess lingers as an orphan after the user clicks Cancel or the configured
+            // timeout fires, leaking memory and CPU. Cat 37.
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+            }
+            catch (Exception killEx)
+            {
+                logger.LogWarning(killEx, "Failed to kill Codex CLI subprocess for run {RunId}.", run.Id);
+            }
+            throw;
+        }
 
         run.Logs += Redact(stdout.ToString());
         if (stderr.Length > 0)
@@ -955,16 +1011,49 @@ public sealed class CodexWorker(
 
     private static string BuildPrompt(string snapshotJson, string module, string promptProfile, string? retryInstruction)
     {
-        var contract = string.Equals(module, "flux-explain", StringComparison.OrdinalIgnoreCase)
-            ? """
-              Return strict JSON with: summary, suggestedExplanation, confidence, evidence[], operations[].
-              The suggestedExplanation must be ready to place into the flux review after user approval.
-              Operations must use only allowedOperations from the snapshot and should include set_flux_explanation.
-              """
-            : """
+        // P2.23 — flux-explain now demands ranked hypotheses with per-line citations.
+        // P1.18 — narrative-rewrite has its own dedicated prose contract; previously fell
+        // through to the QA issues schema and could not produce prose. Cat 13, 21.
+        string contract;
+        if (string.Equals(module, "flux-explain", StringComparison.OrdinalIgnoreCase))
+        {
+            contract = """
+              Return strict JSON with this schema:
+                summary: string (one-paragraph executive summary)
+                suggestedExplanation: string (ready-to-paste flux narrative)
+                confidence: number in [0, 1] (overall confidence in the narrative)
+                hypotheses: array, ranked most-likely first, each:
+                    { rank: int starting at 1, label: string, confidence: number in [0, 1],
+                      journalLineIds: array of string ids copied verbatim from drilldown }
+                evidence: array of { journalLineId: string, accountCode?: string, amount?: number, note?: string }
+                  EVERY evidence element MUST include journalLineId (machine-parseable citation).
+                operations: array using only allowedOperations from the snapshot, including
+                  exactly one set_flux_explanation operation with the chosen narrative.
+              Use the supplied vendorContext, cadenceLabel, and sourceTypeBreakdown directly;
+              do not invent vendor classifications or cadence labels.
+              """;
+        }
+        else if (string.Equals(module, "narrative-rewrite", StringComparison.OrdinalIgnoreCase)
+                 || string.Equals(module, "slide-chat", StringComparison.OrdinalIgnoreCase))
+        {
+            contract = """
+              Return strict JSON with this schema:
+                narrative: string (ACTIVE voice, ≤3 sentences per driver, decision-oriented)
+                drivers: array of { label: string, amountChange: number, percentChange: number,
+                                    direction: "up"|"down", citation: string }
+                decisionsRequired: array of strings (one short imperative each)
+                tone: string echoing the requested promptProfile
+              Cite specific dollar amounts. Avoid filler ("it should be noted", "we observed").
+              Reference only data present in the snapshot.
+              """;
+        }
+        else
+        {
+            contract = """
               Return strict JSON with: summary, issues[]. Each issue must include severity, category, title, description, evidence, confidence, operations[].
               Operations must be selected only from allowedOperations in the snapshot.
               """;
+        }
 
         return """
            You are a server-side Codex CLI worker for a financial reporting application.
@@ -1015,6 +1104,53 @@ public sealed class CodexWorker(
                     return false;
                 }
 
+                // P2.23 — enforce the ranked hypotheses array. Cat 13.
+                if (!document.RootElement.TryGetProperty("hypotheses", out var hypotheses) || hypotheses.ValueKind != JsonValueKind.Array)
+                {
+                    error = "hypotheses array is required (ranked by likelihood)";
+                    return false;
+                }
+                foreach (var h in hypotheses.EnumerateArray())
+                {
+                    if (!h.TryGetProperty("rank", out _) || !h.TryGetProperty("label", out _) || !h.TryGetProperty("confidence", out _))
+                    {
+                        error = "each hypothesis must have rank, label, confidence";
+                        return false;
+                    }
+                }
+
+                // P2.23 — every evidence[] element must carry a machine-parseable
+                // journalLineId so the AI's citations can be verified back to source rows.
+                if (document.RootElement.TryGetProperty("evidence", out var evidence) && evidence.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var e in evidence.EnumerateArray())
+                    {
+                        if (!e.TryGetProperty("journalLineId", out var lineId) || lineId.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(lineId.GetString()))
+                        {
+                            error = "every evidence[] element must include a non-empty journalLineId";
+                            return false;
+                        }
+                    }
+                }
+
+                error = "";
+                return true;
+            }
+
+            if (string.Equals(module, "narrative-rewrite", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(module, "slide-chat", StringComparison.OrdinalIgnoreCase))
+            {
+                // P1.18 — narrative-rewrite returns prose, not the QA-issues schema.
+                if (!document.RootElement.TryGetProperty("narrative", out var narrative) || narrative.ValueKind != JsonValueKind.String)
+                {
+                    error = "narrative string is required";
+                    return false;
+                }
+                if (!document.RootElement.TryGetProperty("drivers", out var drivers) || drivers.ValueKind != JsonValueKind.Array)
+                {
+                    error = "drivers array is required";
+                    return false;
+                }
                 error = "";
                 return true;
             }
@@ -1073,12 +1209,24 @@ public sealed class CodexWorker(
                 .FirstOrDefault();
             var driver = topAccount is null ? "the account activity supplied in the drilldown" : $"{topAccount.name} ({topAccount.amount:0.00} absolute change)";
             var explanation = $"{groupName} changed by {variance:0.00} ({variancePercent:0.0}%) from {priorPeriod} to {currentPeriod}, driven primarily by {driver}. Review the current and prior-period journal detail before approval.";
+
+            // Pull a journalLineId from the drilldown so the mock satisfies the new
+            // citation-required schema and represents what a real Codex call would do.
+            var firstLineId = drilldown?["currentTransactions"]?.AsArray()?.FirstOrDefault()?["journalLineId"]?.GetValue<string>()
+                              ?? drilldown?["priorTransactions"]?.AsArray()?.FirstOrDefault()?["journalLineId"]?.GetValue<string>()
+                              ?? "mock-line-1";
+
             return JsonSerializer.Serialize(new
             {
                 summary = $"Drafted flux explanation for {groupName}.",
                 suggestedExplanation = explanation,
                 confidence = 0.72m,
-                evidence = new[] { new { groupName, currentPeriod, priorPeriod, variance, variancePercent, driver } },
+                hypotheses = new[]
+                {
+                    new { rank = 1, label = $"Driver: {driver}", confidence = 0.72m, journalLineIds = new[] { firstLineId } },
+                    new { rank = 2, label = "Timing / accrual", confidence = 0.18m, journalLineIds = Array.Empty<string>() }
+                },
+                evidence = new[] { new { journalLineId = firstLineId, accountCode = topAccount?.name ?? "", note = driver } },
                 operations = new[] { new { op = "set_flux_explanation", targetType = "fluxReviewGroup", targetId = group?["id"]?.GetValue<string>(), value = new { explanation }, reason = "AI variance explanation draft" } }
             }, new JsonSerializerOptions(JsonSerializerDefaults.Web));
         }
@@ -1089,7 +1237,8 @@ public sealed class CodexWorker(
                 summary = "Drafted flux explanation.",
                 suggestedExplanation = "The selected line changed materially between periods. Review the account-level and journal detail before approving the final explanation.",
                 confidence = 0.55m,
-                evidence = Array.Empty<object>(),
+                hypotheses = new[] { new { rank = 1, label = "Insufficient context", confidence = 0.40m, journalLineIds = Array.Empty<string>() } },
+                evidence = new[] { new { journalLineId = "mock-line-1", accountCode = "", note = "fallback" } },
                 operations = Array.Empty<object>()
             }, new JsonSerializerOptions(JsonSerializerDefaults.Web));
         }
@@ -1202,8 +1351,7 @@ public sealed class ExportService(AppDbContext db, PackageSnapshotBuilder snapsh
         var directory = EnsureExportDirectory();
         var fileName = $"{Slug(package.Organization?.Abbreviation ?? "package")}-{package.ReportingPeriod?.Key ?? "period"}-board-package.pdf";
         var path = Path.Combine(directory, fileName);
-        var lines = BuildPackageLines(package, includeIssues, includeAppendix);
-        await File.WriteAllBytesAsync(path, BuildSimplePdf(lines), cancellationToken);
+        var pageCount = await Task.Run(() => RenderPackagePdf(package, includeIssues, includeAppendix, path), cancellationToken);
 
         return new ExportArtifact
         {
@@ -1214,7 +1362,7 @@ public sealed class ExportService(AppDbContext db, PackageSnapshotBuilder snapsh
             FileName = fileName,
             ContentType = "application/pdf",
             StoragePath = path,
-            MetadataJson = JsonSerializer.Serialize(new { includeIssues, includeAppendix, pageCount = Math.Max(1, package.Slides.Count + 2) }, JsonOptions),
+            MetadataJson = JsonSerializer.Serialize(new { includeIssues, includeAppendix, pageCount, renderer = "QuestPDF" }, JsonOptions),
             CompletedAt = DateTimeOffset.UtcNow
         };
     }
@@ -1381,44 +1529,188 @@ public sealed class ExportService(AppDbContext db, PackageSnapshotBuilder snapsh
         }
     }
 
-    private static byte[] BuildSimplePdf(IEnumerable<string> lines)
+    /// <summary>P1.13 — board-grade PDF rendering via QuestPDF. Cat 27.
+    /// Replaces the prior 46-line ASCII Helvetica stub with: cover page, one section per
+    /// slide with a KPI tile and current/prior/variance summary, narrative blocks rendered
+    /// as paragraphs, optional QA Issues section, optional Appendix, branding from
+    /// ThemeJson, page numbers in the footer.</summary>
+    private static int RenderPackagePdf(ReportPackage package, bool includeIssues, bool includeAppendix, string path)
     {
-        var textCommands = new StringBuilder("BT /F1 10 Tf 54 760 Td 14 TL\n");
-        foreach (var line in lines.Take(46))
-        {
-            textCommands.Append('(').Append(EscapePdf(line)).Append(") Tj T*\n");
-        }
-        textCommands.Append("ET");
+        var theme = ParseTheme(package.ThemeJson);
+        var primaryHex = theme.Primary;
+        var accentHex = theme.Accent;
+        var fontFamily = theme.FontFamily;
+        var headerText = string.IsNullOrWhiteSpace(theme.HeaderText) ? package.Organization?.Name ?? "Board Package" : theme.HeaderText;
+        var footerText = string.IsNullOrWhiteSpace(theme.FooterText) ? "Confidential — Board distribution" : theme.FooterText;
 
-        var objects = new List<string>
+        var document = QuestPDF.Fluent.Document.Create(container =>
         {
-            "1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n",
-            "2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n",
-            "3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj\n",
-            "4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n",
-            $"5 0 obj << /Length {Encoding.ASCII.GetByteCount(textCommands.ToString())} >> stream\n{textCommands}\nendstream endobj\n"
-        };
+            // ── Cover page ──────────────────────────────────────────────────────────
+            container.Page(page =>
+            {
+                page.Size(QuestPDF.Helpers.PageSizes.Letter);
+                page.Margin(36);
+                page.DefaultTextStyle(t => t.FontFamily(fontFamily));
+                page.Content().Column(col =>
+                {
+                    col.Spacing(12);
+                    col.Item().Text(headerText).FontSize(28).Bold().FontColor(primaryHex);
+                    col.Item().Text($"{package.ReportingPeriod?.Label ?? package.ReportingPeriod?.Key}").FontSize(18).FontColor(accentHex);
+                    col.Item().Text($"Version: {package.VersionLabel}").FontSize(12);
+                    if (package.IsApproved)
+                    {
+                        col.Item().Text($"Approved by {package.ApprovedBy} on {package.ApprovedAt:yyyy-MM-dd HH:mm}Z").FontSize(11).FontColor("#2A7A2A");
+                    }
+                    else
+                    {
+                        col.Item().Text("DRAFT — not yet approved").FontSize(11).FontColor("#A0522D");
+                    }
+                    col.Item().PaddingTop(12).Text(theme.Tagline).FontSize(11).Italic();
+                });
+                page.Footer().AlignCenter().Text(text =>
+                {
+                    text.Span(footerText).FontSize(9).FontColor("#777");
+                });
+            });
 
-        var pdf = new StringBuilder("%PDF-1.4\n");
-        var offsets = new List<int> { 0 };
-        foreach (var obj in objects)
-        {
-            offsets.Add(Encoding.ASCII.GetByteCount(pdf.ToString()));
-            pdf.Append(obj);
-        }
+            // ── One page per slide ──────────────────────────────────────────────────
+            foreach (var slide in package.Slides.OrderBy(x => x.SortOrder))
+            {
+                container.Page(page =>
+                {
+                    page.Size(QuestPDF.Helpers.PageSizes.Letter);
+                    page.Margin(36);
+                    page.DefaultTextStyle(t => t.FontFamily(fontFamily));
+                    page.Header().BorderBottom(1).BorderColor(primaryHex).PaddingBottom(8).Row(row =>
+                    {
+                        row.RelativeItem().Text(headerText).FontSize(11).Bold().FontColor(primaryHex);
+                        row.ConstantItem(140).AlignRight().Text(package.ReportingPeriod?.Label ?? "").FontSize(10).FontColor("#666");
+                    });
+                    page.Content().PaddingVertical(14).Column(col =>
+                    {
+                        col.Spacing(10);
+                        col.Item().Text(slide.Subject).FontSize(20).Bold().FontColor(primaryHex);
+                        if (!string.IsNullOrWhiteSpace(slide.KpiLabel))
+                        {
+                            col.Item().Text(slide.KpiLabel).FontSize(12).FontColor("#555");
+                        }
+                        col.Item().Background(accentHex + "20").Padding(8).Row(metricsRow =>
+                        {
+                            metricsRow.RelativeItem().Column(cell => { cell.Item().Text("Current").FontSize(9).FontColor("#666"); cell.Item().Text(slide.CurrentValue.ToString("C0")).FontSize(14).Bold(); });
+                            metricsRow.RelativeItem().Column(cell => { cell.Item().Text("Prior").FontSize(9).FontColor("#666"); cell.Item().Text(slide.PriorValue.ToString("C0")).FontSize(14); });
+                            metricsRow.RelativeItem().Column(cell =>
+                            {
+                                cell.Item().Text("Variance").FontSize(9).FontColor("#666");
+                                var color = slide.VarianceAmount >= 0m ? "#1F6F3A" : "#9B2C2C";
+                                cell.Item().Text($"{slide.VarianceAmount:C0} ({slide.VariancePercent:0.0}%)").FontSize(14).Bold().FontColor(color);
+                            });
+                        });
 
-        var xrefOffset = Encoding.ASCII.GetByteCount(pdf.ToString());
-        pdf.Append("xref\n0 6\n0000000000 65535 f \n");
-        foreach (var offset in offsets.Skip(1))
-        {
-            pdf.Append(offset.ToString("0000000000")).Append(" 00000 n \n");
-        }
-        pdf.Append("trailer << /Size 6 /Root 1 0 R >>\nstartxref\n").Append(xrefOffset).Append("\n%%EOF");
-        return Encoding.ASCII.GetBytes(pdf.ToString());
+                        foreach (var block in slide.Blocks
+                                     .Where(x => x.Kind is "text" or "callout")
+                                     .OrderBy(x => x.SortOrder))
+                        {
+                            var text = ExtractTextFromJson(block.ContentJson);
+                            if (string.IsNullOrWhiteSpace(text))
+                            {
+                                continue;
+                            }
+                            // P1.17 — visually mark AI-authored blocks. Cat 25.
+                            var prefix = block.IsAiAuthored ? "✨ " : "";
+                            col.Item().Text($"{prefix}{text}").FontSize(11);
+                        }
+                    });
+                    page.Footer().Row(footRow =>
+                    {
+                        footRow.RelativeItem().Text(footerText).FontSize(9).FontColor("#777");
+                        footRow.ConstantItem(80).AlignRight().Text(text =>
+                        {
+                            text.Span("Page ").FontSize(9).FontColor("#777");
+                            text.CurrentPageNumber().FontSize(9);
+                            text.Span(" / ").FontSize(9).FontColor("#777");
+                            text.TotalPages().FontSize(9);
+                        });
+                    });
+                });
+            }
+
+            // ── QA Issues ───────────────────────────────────────────────────────────
+            if (includeIssues && package.Issues.Count > 0)
+            {
+                container.Page(page =>
+                {
+                    page.Size(QuestPDF.Helpers.PageSizes.Letter);
+                    page.Margin(36);
+                    page.DefaultTextStyle(t => t.FontFamily(fontFamily));
+                    page.Header().BorderBottom(1).BorderColor(primaryHex).PaddingBottom(8)
+                        .Text("QA Issues").FontSize(16).Bold().FontColor(primaryHex);
+                    page.Content().PaddingTop(12).Column(col =>
+                    {
+                        col.Spacing(6);
+                        foreach (var issue in package.Issues.OrderByDescending(x => x.CreatedAt))
+                        {
+                            col.Item().Text($"[{issue.Severity} · {issue.Status}] {issue.Title}").FontSize(11).Bold();
+                            col.Item().Text(issue.Description).FontSize(10).FontColor("#555");
+                        }
+                    });
+                });
+            }
+
+            // ── Appendix ────────────────────────────────────────────────────────────
+            if (includeAppendix)
+            {
+                container.Page(page =>
+                {
+                    page.Size(QuestPDF.Helpers.PageSizes.Letter);
+                    page.Margin(36);
+                    page.DefaultTextStyle(t => t.FontFamily(fontFamily));
+                    page.Header().BorderBottom(1).BorderColor(primaryHex).PaddingBottom(8)
+                        .Text("Appendix").FontSize(16).Bold().FontColor(primaryHex);
+                    page.Content().PaddingTop(12).Column(col =>
+                    {
+                        col.Spacing(6);
+                        col.Item().Text("Source data").FontSize(12).Bold();
+                        col.Item().Text("Persisted package, GL mappings, elimination overlays, KPI data, and AI review records.").FontSize(10);
+                        col.Item().PaddingTop(8).Text("Approval status").FontSize(12).Bold();
+                        col.Item().Text(package.IsApproved
+                            ? $"Approved by {package.ApprovedBy} at {package.ApprovedAt:yyyy-MM-dd HH:mm}Z"
+                            : "Not yet approved.").FontSize(10);
+                    });
+                });
+            }
+        });
+
+        document.GeneratePdf(path);
+        // Approximate page count for export QA metadata; QuestPDF doesn't expose it cheaply
+        // without re-rendering, so use slide-count + cover + optional sections.
+        return 1 + package.Slides.Count + (includeIssues ? 1 : 0) + (includeAppendix ? 1 : 0);
     }
 
-    private static string EscapePdf(string value)
-        => value.Replace("\\", "\\\\").Replace("(", "\\(").Replace(")", "\\)");
+    private static (string Primary, string Accent, string FontFamily, string HeaderText, string FooterText, string Tagline) ParseTheme(string themeJson)
+    {
+        var primary = "#0F2A4A";
+        var accent = "#6B4FA8";
+        var family = "Inter";
+        var header = "";
+        var footer = "";
+        var tagline = "Confidential financial reporting";
+        try
+        {
+            using var doc = JsonDocument.Parse(themeJson);
+            var root = doc.RootElement;
+            if (root.TryGetProperty("primary", out var p) && p.ValueKind == JsonValueKind.String) primary = p.GetString() ?? primary;
+            if (root.TryGetProperty("accent", out var a) && a.ValueKind == JsonValueKind.String) accent = a.GetString() ?? accent;
+            if (root.TryGetProperty("fontFamily", out var f) && f.ValueKind == JsonValueKind.String) family = f.GetString() ?? family;
+            if (root.TryGetProperty("headerText", out var h) && h.ValueKind == JsonValueKind.String) header = h.GetString() ?? "";
+            if (root.TryGetProperty("footerText", out var ft) && ft.ValueKind == JsonValueKind.String) footer = ft.GetString() ?? "";
+            if (root.TryGetProperty("tagline", out var tg) && tg.ValueKind == JsonValueKind.String) tagline = tg.GetString() ?? tagline;
+        }
+        catch
+        {
+            // fall through to defaults
+        }
+        return (primary, accent, family, header, footer, tagline);
+    }
 
     private static string ExtractTextFromJson(string json)
     {
@@ -1433,86 +1725,89 @@ public sealed class ExportService(AppDbContext db, PackageSnapshotBuilder snapsh
         }
     }
 
+    /// <summary>P1.14 — board-grade XLSX rendering via ClosedXML. Cat 27.
+    /// Every column with a numeric header (Amount, Current, Prior, Variance, etc.) gets a
+    /// real numeric cell with format codes; header rows are bold + frozen; columns
+    /// auto-size. Replaces the prior all-string inlineStr stub that broke Excel formulas.</summary>
     private static async Task WriteXlsxAsync(string path, Dictionary<string, string[][]> sheets, CancellationToken cancellationToken)
     {
-        await using var stream = File.Create(path);
-        using var archive = new ZipArchive(stream, ZipArchiveMode.Create);
-        AddEntry(archive, "[Content_Types].xml", """
-            <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-            <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-              <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-              <Default Extension="xml" ContentType="application/xml"/>
-              <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
-            </Types>
-            """);
-        AddEntry(archive, "_rels/.rels", """
-            <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-            <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-              <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
-            </Relationships>
-            """);
-        AddEntry(archive, "xl/workbook.xml", BuildWorkbookXml(sheets.Keys.ToArray()));
-        AddEntry(archive, "xl/_rels/workbook.xml.rels", BuildWorkbookRels(sheets.Count));
-
-        var sheetIndex = 1;
-        foreach (var sheet in sheets)
+        await Task.Run(() =>
         {
-            AddEntry(archive, $"xl/worksheets/sheet{sheetIndex++}.xml", BuildWorksheetXml(sheet.Value));
-        }
+            using var workbook = new ClosedXML.Excel.XLWorkbook();
+            foreach (var (sheetName, rows) in sheets)
+            {
+                if (rows.Length == 0)
+                {
+                    continue;
+                }
+                // ClosedXML caps sheet names at 31 chars and disallows certain symbols.
+                var safeName = SanitizeSheetName(sheetName);
+                var sheet = workbook.Worksheets.Add(safeName);
+                var headers = rows[0];
+                var numericColumns = DetectNumericColumns(headers);
 
-        await stream.FlushAsync(cancellationToken);
+                for (var c = 0; c < headers.Length; c++)
+                {
+                    var headerCell = sheet.Cell(1, c + 1);
+                    headerCell.Value = headers[c];
+                    headerCell.Style.Font.Bold = true;
+                    headerCell.Style.Fill.BackgroundColor = ClosedXML.Excel.XLColor.FromArgb(15, 42, 74);
+                    headerCell.Style.Font.FontColor = ClosedXML.Excel.XLColor.White;
+                }
+
+                for (var r = 1; r < rows.Length; r++)
+                {
+                    var row = rows[r];
+                    for (var c = 0; c < row.Length; c++)
+                    {
+                        var cell = sheet.Cell(r + 1, c + 1);
+                        if (numericColumns.Contains(c)
+                            && decimal.TryParse(row[c], NumberStyles.Any, CultureInfo.InvariantCulture, out var amount))
+                        {
+                            cell.Value = amount;
+                            cell.Style.NumberFormat.Format = headers[c].Contains("%", StringComparison.Ordinal)
+                                ? "0.0%"
+                                : "#,##0.00;(#,##0.00)";
+                        }
+                        else
+                        {
+                            cell.Value = row[c];
+                        }
+                    }
+                }
+
+                // Freeze the header row, auto-size columns, and add a thin filter on the header.
+                if (rows.Length > 1 && headers.Length > 0)
+                {
+                    sheet.SheetView.FreezeRows(1);
+                    sheet.RangeUsed()?.SetAutoFilter();
+                    sheet.Columns().AdjustToContents();
+                }
+            }
+            workbook.SaveAs(path);
+        }, cancellationToken);
     }
 
-    private static void AddEntry(ZipArchive archive, string name, string content)
+    private static string SanitizeSheetName(string name)
     {
-        var entry = archive.CreateEntry(name, CompressionLevel.Fastest);
-        using var writer = new StreamWriter(entry.Open(), Encoding.UTF8);
-        writer.Write(content);
+        var cleaned = string.Concat(name.Where(ch => ch != '/' && ch != '\\' && ch != '?' && ch != '*' && ch != '[' && ch != ']' && ch != ':'));
+        return cleaned.Length > 31 ? cleaned[..31] : cleaned;
     }
 
-    private static string BuildWorkbookXml(string[] sheetNames)
-        => $"""
-            <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-            <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
-              <sheets>{string.Concat(sheetNames.Select((name, index) => $"""<sheet name="{Xml(name)}" sheetId="{index + 1}" r:id="rId{index + 1}"/>"""))}</sheets>
-            </workbook>
-            """;
-
-    private static string BuildWorkbookRels(int count)
-        => $"""
-            <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-            <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-              {string.Concat(Enumerable.Range(1, count).Select(i => $"""<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{i}.xml"/>"""))}
-            </Relationships>
-            """;
-
-    private static string BuildWorksheetXml(string[][] rows)
-        => $"""
-            <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-            <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-              <sheetData>
-                {string.Concat(rows.Select((row, rowIndex) => $"""<row r="{rowIndex + 1}">{string.Concat(row.Select((cell, columnIndex) => InlineCell(rowIndex + 1, columnIndex + 1, cell)))}</row>"""))}
-              </sheetData>
-            </worksheet>
-            """;
-
-    private static string InlineCell(int row, int column, string value)
-        => $"""<c r="{ColumnName(column)}{row}" t="inlineStr"><is><t>{Xml(value)}</t></is></c>""";
-
-    private static string ColumnName(int column)
+    private static HashSet<int> DetectNumericColumns(string[] headers)
     {
-        var name = "";
-        while (column > 0)
+        var set = new HashSet<int>();
+        var hints = new[] { "amount", "current", "prior", "variance", "confidence", "% ", "%", "value", "balance", "total", "rate" };
+        for (var i = 0; i < headers.Length; i++)
         {
-            column--;
-            name = (char)('A' + column % 26) + name;
-            column /= 26;
+            var lower = headers[i].ToLowerInvariant();
+            if (hints.Any(hint => lower.Contains(hint, StringComparison.Ordinal)))
+            {
+                set.Add(i);
+            }
         }
-        return name;
+        return set;
     }
-
-    private static string Xml(string value)
-        => System.Security.SecurityElement.Escape(value) ?? "";
 
     private static string Slug(string value)
         => string.Concat(value.ToLowerInvariant().Select(ch => char.IsLetterOrDigit(ch) ? ch : '-')).Trim('-');
@@ -1523,6 +1818,7 @@ public sealed class XeroIntegrationService(
     IHttpClientFactory httpClientFactory,
     IDataProtectionProvider dataProtectionProvider,
     MappingService mappingService,
+    XeroTokenRefreshLock refreshLock,
     ILogger<XeroIntegrationService> logger)
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
@@ -1548,7 +1844,7 @@ public sealed class XeroIntegrationService(
             redirectUri,
             scopes,
             environment = configuration.GetValue("Ai:UseMockRunner", true) ? "Development" : "Production-like",
-            allowLocalStubReports = configuration.GetValue("Xero:AllowLocalStubReports", true),
+            allowLocalStubReports = configuration.GetValue("Xero:AllowLocalStubReports", false),
             connections = connections?.Select(c => new
             {
                 c.Id,
@@ -1762,13 +2058,50 @@ public sealed class XeroIntegrationService(
         var connection = await db.XeroConnections
             .FirstOrDefaultAsync(x => x.OrganizationId == package.OrganizationId && x.ConnectionStatus == "Connected", cancellationToken)
             ?? await db.XeroConnections.FirstOrDefaultAsync(x => x.OrganizationId == package.OrganizationId, cancellationToken);
+        if (connection is null || !string.Equals(connection.ConnectionStatus, "Connected", StringComparison.OrdinalIgnoreCase))
+        {
+            connection = await BuildGlobalTenantConnectionForPackageAsync(db, package, cancellationToken) ?? connection;
+        }
         return await SyncPackageCoreAsync(db, package, connection, "accrual", cancellationToken);
+    }
+
+    private static async Task<XeroConnection?> BuildGlobalTenantConnectionForPackageAsync(AppDbContext db, ReportPackage package, CancellationToken cancellationToken)
+    {
+        var row = await db.XeroTenantEntityMappings
+            .AsNoTracking()
+            .Where(mapping => mapping.OrganizationId == package.OrganizationId && !mapping.IsIgnored)
+            .Join(db.XeroTenantConnections.AsNoTracking().Where(tenant => tenant.ConnectionStatus == "Connected"),
+                mapping => mapping.TenantId,
+                tenant => tenant.TenantId,
+                (mapping, tenant) => tenant)
+            .OrderBy(tenant => tenant.TenantName)
+            .FirstOrDefaultAsync(cancellationToken);
+        if (row is null)
+        {
+            return null;
+        }
+
+        return new XeroConnection
+        {
+            Id = row.Id,
+            OrganizationId = package.OrganizationId,
+            TenantId = row.TenantId,
+            TenantName = row.TenantName,
+            TenantType = row.TenantType,
+            EncryptedAccessToken = row.EncryptedAccessToken,
+            EncryptedRefreshToken = row.EncryptedRefreshToken,
+            TokenExpiresAt = row.TokenExpiresAt,
+            Scopes = row.Scopes,
+            ConnectionStatus = row.ConnectionStatus,
+            LastConnectedAt = row.LastConnectedAt,
+            LastError = row.LastError
+        };
     }
 
     public async Task<XeroPeriodSyncResult> SyncPeriodAsync(AppDbContext db, XeroPeriodSyncOptions options, CancellationToken cancellationToken)
     {
         var period = await EnsureReportingPeriodAsync(db, options.PeriodKey, cancellationToken);
-        var allowStub = configuration.GetValue("Xero:AllowLocalStubReports", true);
+        var allowStub = configuration.GetValue("Xero:AllowLocalStubReports", false);
         var connections = new List<XeroConnection>();
         var globalTenants = await db.XeroTenantConnections
             .Where(x => allowStub || x.ConnectionStatus == "Connected")
@@ -2041,7 +2374,7 @@ public sealed class XeroIntegrationService(
                 });
             }
 
-            await RegeneratePackageSlidesAsync(db, package, imported.StatementLines, cancellationToken);
+            await RegeneratePackageSlidesAsync(db, package, imported.StatementLines, imported.Accounts, cancellationToken);
             var tieOut = BuildTieOut(imported.StatementLines);
             db.StatementQaResults.Add(new StatementQaResult
             {
@@ -2054,8 +2387,8 @@ public sealed class XeroIntegrationService(
 
             package.LastXeroSyncAt = DateTimeOffset.UtcNow;
             package.Status = PackageStatus.Review;
-            package.BaseFrom = "January 2025";
-            package.VersionLabel = "January 2026 draft";
+            package.BaseFrom = BuildPriorYearLabel(package.ReportingPeriod);
+            package.VersionLabel = $"{package.ReportingPeriod?.Label ?? "Financial"} draft";
             package.UpdatedAt = DateTimeOffset.UtcNow;
             run.Status = "Completed";
             run.CompletedAt = DateTimeOffset.UtcNow;
@@ -2079,6 +2412,12 @@ public sealed class XeroIntegrationService(
         }
         catch (Exception ex)
         {
+            package.Status = package.LastXeroSyncAt is null ? PackageStatus.Blocked : PackageStatus.Review;
+            package.BlockReason = "Latest Xero refresh failed. Existing package data was left in place; reconnect the tenant and retry.";
+            package.IsSourceDataStale = true;
+            package.SourceDataStaleReason = package.BlockReason;
+            package.SourceDataChangedAt = DateTimeOffset.UtcNow;
+            package.UpdatedAt = DateTimeOffset.UtcNow;
             run.Status = "Failed";
             run.Error = "Xero sync failed. Reconnect the tenant and retry.";
             run.CompletedAt = DateTimeOffset.UtcNow;
@@ -2351,8 +2690,8 @@ public sealed class XeroIntegrationService(
             ReportingPeriodId = period.Id,
             ReportingPeriod = period,
             Status = PackageStatus.Draft,
-            VersionLabel = "January 2026 draft",
-            BaseFrom = "January 2025",
+            VersionLabel = $"{period.Label} draft",
+            BaseFrom = BuildPriorYearLabel(period),
             ThemeJson = JsonSerializer.Serialize(new { primary = organization.PrimaryColor, accent = organization.AccentColor, organization.CoverStyle }, JsonOptions)
         };
         db.ReportPackages.Add(package);
@@ -2360,7 +2699,7 @@ public sealed class XeroIntegrationService(
         return package;
     }
 
-    private async Task RegeneratePackageSlidesAsync(AppDbContext db, ReportPackage package, IReadOnlyList<XeroStatementLineImport> lines, CancellationToken cancellationToken)
+    private async Task RegeneratePackageSlidesAsync(AppDbContext db, ReportPackage package, IReadOnlyList<XeroStatementLineImport> lines, IReadOnlyList<XeroImportedAccount> accounts, CancellationToken cancellationToken)
     {
         await db.SlideBlocks
             .Where(x => db.PackageSlides.Where(s => s.ReportPackageId == package.Id).Select(s => s.Id).Contains(x.PackageSlideId))
@@ -2369,25 +2708,84 @@ public sealed class XeroIntegrationService(
             .Where(x => x.ReportPackageId == package.Id)
             .ExecuteDeleteAsync(cancellationToken);
 
-        var pnlLines = lines
-            .Where(x => x.StatementType == "ProfitAndLoss" && Math.Abs(x.CurrentAmount) > 0.01m)
-            .OrderByDescending(x => Math.Abs(x.CurrentAmount))
+        var resolvedLines = lines
+            .Where(x => x.StatementType is "ProfitAndLoss" or "BalanceSheet" && Math.Abs(x.CurrentAmount) > 0.01m)
+            .Select(line => new
+            {
+                Line = line,
+                Accounts = ResolveAccountsForStatementLine(line, accounts)
+            })
+            .ToList();
+
+        var pnlLines = resolvedLines
+            .Where(x => x.Line.StatementType == "ProfitAndLoss" && !IsSummaryStatementLine(x.Line))
+            .OrderByDescending(x => x.Accounts.Count > 0)
+            .ThenByDescending(x => Math.Abs(x.Line.CurrentAmount - x.Line.PriorAmount))
+            .ThenByDescending(x => Math.Abs(x.Line.CurrentAmount))
             .Take(6)
             .ToList();
         if (pnlLines.Count == 0)
         {
-            pnlLines = lines
-                .Where(x => x.StatementType is "BalanceSheet" or "TrialBalance")
-                .OrderByDescending(x => Math.Abs(x.CurrentAmount))
+            pnlLines = resolvedLines
+                .Where(x => !IsSummaryStatementLine(x.Line))
+                .OrderByDescending(x => x.Accounts.Count > 0)
+                .ThenByDescending(x => Math.Abs(x.Line.CurrentAmount))
+                .Take(4)
+                .ToList();
+        }
+        if (pnlLines.Count == 0)
+        {
+            pnlLines = resolvedLines
+                .OrderByDescending(x => Math.Abs(x.Line.CurrentAmount))
                 .Take(4)
                 .ToList();
         }
 
         var sort = 1;
-        foreach (var line in pnlLines)
+        var periodLabel = package.ReportingPeriod?.Label ?? "current period";
+        var priorLabel = package.ReportingPeriod is null
+            ? "prior year"
+            : new DateOnly(package.ReportingPeriod.PeriodStart.Year - 1, package.ReportingPeriod.PeriodStart.Month, 1).ToString("MMMM yyyy", CultureInfo.InvariantCulture);
+        foreach (var resolved in pnlLines)
         {
+            var line = resolved.Line;
+            var linkedAccounts = resolved.Accounts;
             var variance = FinancialMath.Variance(line.CurrentAmount, line.PriorAmount);
             var monthly = FindTrendAmounts(lines, line);
+            var accountCodes = linkedAccounts
+                .Select(x => x.Code)
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            var topAccounts = linkedAccounts
+                .OrderByDescending(x => Math.Abs(x.MonthlyBalances.LastOrDefault()))
+                .Take(8)
+                .Select(account => new
+                {
+                    account.Code,
+                    account.Name,
+                    account.Type,
+                    account.FsLine,
+                    account.AiSuggestedFsLine,
+                    Current = account.MonthlyBalances.LastOrDefault(),
+                    TransactionCount = account.Transactions.Length
+                })
+                .ToArray();
+            var transactionPreview = linkedAccounts
+                .SelectMany(account => account.Transactions.Select(tx => new
+                {
+                    account.Code,
+                    account.Name,
+                    Date = tx.TransactionDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+                    tx.Description,
+                    Amount = tx.Credit - tx.Debit,
+                    tx.Source
+                }))
+                .OrderByDescending(x => Math.Abs(x.Amount))
+                .ThenByDescending(x => x.Date)
+                .Take(12)
+                .ToArray();
+            var explanationSeed = BuildPackageNarrative(line.LineName, line.CurrentAmount, line.PriorAmount, variance, periodLabel, priorLabel, topAccounts.Select(x => x.Name).ToArray());
             var slide = new PackageSlide
             {
                 Id = Guid.NewGuid(),
@@ -2399,17 +2797,18 @@ public sealed class XeroIntegrationService(
                 PriorValue = line.PriorAmount,
                 VarianceAmount = variance.Amount,
                 VariancePercent = variance.Percent,
-                AccountCodesCsv = line.AccountCode,
+                AccountCodesCsv = accountCodes.Length > 0 ? string.Join(",", accountCodes) : line.AccountCode,
                 MonthlyJson = JsonSerializer.Serialize(monthly, JsonOptions),
                 PriorMonthlyJson = JsonSerializer.Serialize(monthly.Select(x => Math.Round(x * 0.9m, 2)).ToArray(), JsonOptions),
-                ChartConfigJson = JsonSerializer.Serialize(new { type = "clustered", dataset = "trended-p-l", showPY = true, showLegend = true }, JsonOptions),
+                ChartConfigJson = JsonSerializer.Serialize(new { type = "clustered", dataset = "trended-p-l", showPY = true, showLegend = true, statementType = line.StatementType, rowPath = line.RowPath, accountCodes }, JsonOptions),
                 Blocks =
                 [
-                    new SlideBlock { Id = Guid.NewGuid(), SortOrder = 1, Kind = "kpi", ContentJson = JsonSerializer.Serialize(new { label = line.LineName, current = line.CurrentAmount, prior = line.PriorAmount, variance = variance.Amount }, JsonOptions) },
-                    new SlideBlock { Id = Guid.NewGuid(), SortOrder = 2, Kind = "chart", ContentJson = JsonSerializer.Serialize(new { type = "clustered", showPY = true, showLegend = true, showGrid = true }, JsonOptions) },
-                    new SlideBlock { Id = Guid.NewGuid(), SortOrder = 3, Kind = "drivers", ContentJson = JsonSerializer.Serialize(new { accounts = string.IsNullOrWhiteSpace(line.AccountCode) ? Array.Empty<string>() : [line.AccountCode], section = line.Section }, JsonOptions) },
-                    new SlideBlock { Id = Guid.NewGuid(), SortOrder = 4, Kind = "text", ContentJson = JsonSerializer.Serialize(new { text = $"{line.LineName} was {line.CurrentAmount:C0} for January 2026 versus {line.PriorAmount:C0} in January 2025." }, JsonOptions) },
-                    new SlideBlock { Id = Guid.NewGuid(), SortOrder = 5, Kind = "callout", ContentJson = JsonSerializer.Serialize(new { text = "Generated from Xero accrual-basis reports. Review mapping and first-seen accounts before final distribution." }, JsonOptions) }
+                    new SlideBlock { Id = Guid.NewGuid(), SortOrder = 1, Kind = "kpi", ContentJson = JsonSerializer.Serialize(new { componentVariant = "key-number", width = "half", label = line.LineName, componentTitle = line.LineName, current = line.CurrentAmount, prior = line.PriorAmount, variance = variance.Amount, accountCodes }, JsonOptions) },
+                    new SlideBlock { Id = Guid.NewGuid(), SortOrder = 2, Kind = "chart", ContentJson = JsonSerializer.Serialize(new { componentVariant = "year-over-year", width = "full", type = "clustered", showPY = true, showLegend = true, showGrid = true, showDataLabels = true, componentTitle = $"{line.LineName} trend", accountCodes }, JsonOptions) },
+                    new SlideBlock { Id = Guid.NewGuid(), SortOrder = 3, Kind = "drivers", ContentJson = JsonSerializer.Serialize(new { componentVariant = "driver-evidence", width = "full", accounts = accountCodes, topAccounts, transactions = transactionPreview, section = line.Section, statementType = line.StatementType, rowPath = line.RowPath }, JsonOptions) },
+                    new SlideBlock { Id = Guid.NewGuid(), SortOrder = 4, Kind = "text", ContentJson = JsonSerializer.Serialize(new { componentVariant = "commentary", width = "full", componentTitle = "Board commentary", text = explanationSeed }, JsonOptions) },
+                    new SlideBlock { Id = Guid.NewGuid(), SortOrder = 5, Kind = "table", ContentJson = JsonSerializer.Serialize(new { componentVariant = transactionPreview.Length > 0 ? "transaction-drilldown" : "financial-summary", width = "full", componentTitle = transactionPreview.Length > 0 ? "Transaction drilldown" : "Financial summary", accountCodes, topAccounts, transactions = transactionPreview }, JsonOptions) },
+                    new SlideBlock { Id = Guid.NewGuid(), SortOrder = 6, Kind = "callout", ContentJson = JsonSerializer.Serialize(new { componentVariant = "callout", width = "half", text = accountCodes.Length > 0 ? $"Linked to {accountCodes.Length} GL account{(accountCodes.Length == 1 ? "" : "s")} for flux and package QA." : "No GL account matched this statement row yet. Review FS line mappings before final distribution." }, JsonOptions) }
                 ]
             };
             db.PackageSlides.Add(slide);
@@ -2419,12 +2818,87 @@ public sealed class XeroIntegrationService(
         {
             Id = Guid.NewGuid(),
             ReportPackageId = package.Id,
-            VersionLabel = $"Xero January {DateTimeOffset.UtcNow:HH:mm}",
+            VersionLabel = $"Xero {package.ReportingPeriod?.Label ?? "sync"} {DateTimeOffset.UtcNow:HH:mm}",
             CreatedBy = "Xero Sync",
-            ChangeSummary = "Generated January 2026 entity financial package from Xero reports",
+            ChangeSummary = $"Generated {package.ReportingPeriod?.Label ?? "entity"} financial package from Xero reports",
             SnapshotJson = JsonSerializer.Serialize(new { package.Id, statementLines = lines.Count }, JsonOptions)
         });
     }
+
+    private static string BuildPriorYearLabel(ReportingPeriod? period)
+        => period is null
+            ? "Prior year"
+            : new DateOnly(period.PeriodStart.Year - 1, period.PeriodStart.Month, 1).ToString("MMMM yyyy", CultureInfo.InvariantCulture);
+
+    private static List<XeroImportedAccount> ResolveAccountsForStatementLine(XeroStatementLineImport line, IReadOnlyList<XeroImportedAccount> accounts)
+    {
+        var matches = new List<XeroImportedAccount>();
+        if (!string.IsNullOrWhiteSpace(line.AccountCode))
+        {
+            matches.AddRange(accounts.Where(x => string.Equals(x.Code, line.AccountCode, StringComparison.OrdinalIgnoreCase)));
+        }
+
+        var lineName = NormalizeMatchText(line.LineName);
+        var section = NormalizeMatchText(line.Section);
+        var rowPath = NormalizeMatchText(line.RowPath);
+        foreach (var account in accounts)
+        {
+            if (matches.Any(x => string.Equals(x.Code, account.Code, StringComparison.OrdinalIgnoreCase)))
+            {
+                continue;
+            }
+
+            var accountName = NormalizeMatchText(account.Name);
+            var fsLine = NormalizeMatchText(account.FsLine);
+            var aiFsLine = NormalizeMatchText(account.AiSuggestedFsLine);
+            if ((!string.IsNullOrWhiteSpace(accountName) && (lineName == accountName || rowPath.Contains(accountName, StringComparison.Ordinal)))
+                || (!string.IsNullOrWhiteSpace(fsLine) && (lineName == fsLine || rowPath.Contains(fsLine, StringComparison.Ordinal)))
+                || (!string.IsNullOrWhiteSpace(aiFsLine) && (lineName == aiFsLine || rowPath.Contains(aiFsLine, StringComparison.Ordinal)))
+                || (!string.IsNullOrWhiteSpace(section) && !IsBroadStatementSection(section) && (fsLine == section || aiFsLine == section)))
+            {
+                matches.Add(account);
+            }
+        }
+
+        return matches
+            .GroupBy(x => x.Code, StringComparer.OrdinalIgnoreCase)
+            .Select(x => x.First())
+            .ToList();
+    }
+
+    private static bool IsSummaryStatementLine(XeroStatementLineImport line)
+        => line.LineName.StartsWith("Total ", StringComparison.OrdinalIgnoreCase)
+           || line.LineName.Contains("Gross Profit", StringComparison.OrdinalIgnoreCase)
+           || line.LineName.Contains("Net Income", StringComparison.OrdinalIgnoreCase)
+           || line.LineName.Contains("Operating Profit", StringComparison.OrdinalIgnoreCase)
+           || line.RowPath.Contains(" / Total ", StringComparison.OrdinalIgnoreCase);
+
+    private static string BuildPackageNarrative(string lineName, decimal current, decimal prior, VarianceResult variance, string periodLabel, string priorLabel, IReadOnlyList<string> accountNames)
+    {
+        var direction = variance.Amount >= 0m ? "up" : "down";
+        var drivers = accountNames.Count == 0
+            ? "The underlying GL account mapping still needs finance review before final package release."
+            : $"Primary linked accounts: {string.Join(", ", accountNames.Take(4))}.";
+        return $"{lineName} was {FormatCurrency(current)} for {periodLabel} versus {FormatCurrency(prior)} in {priorLabel}, {direction} {FormatCurrency(Math.Abs(variance.Amount))} ({Math.Abs(variance.Percent):0.0}%). {drivers}";
+    }
+
+    private static string FormatCurrency(decimal value)
+    {
+        var sign = value < 0m ? "-" : "";
+        return $"{sign}${Math.Abs(value).ToString("N0", CultureInfo.InvariantCulture)}";
+    }
+
+    private static string NormalizeMatchText(string value)
+    {
+        var chars = value
+            .ToLowerInvariant()
+            .Select(ch => char.IsLetterOrDigit(ch) ? ch : ' ')
+            .ToArray();
+        return string.Join(' ', new string(chars).Split(' ', StringSplitOptions.RemoveEmptyEntries));
+    }
+
+    private static bool IsBroadStatementSection(string value)
+        => value is "income" or "revenue" or "expenses" or "expense" or "assets" or "liabilities" or "equity" or "trial balance";
 
     private static decimal[] FindTrendAmounts(IEnumerable<XeroStatementLineImport> lines, XeroStatementLineImport source)
     {
@@ -2761,6 +3235,14 @@ public sealed class XeroIntegrationService(
             return Unprotect(connection.EncryptedAccessToken);
         }
 
+        // Per-tenant lock with re-check inside it. Cat 1.
+        using var _ = await refreshLock.AcquireAsync(connection.TenantId, cancellationToken);
+        await db.Entry(connection).ReloadAsync(cancellationToken);
+        if (connection.TokenExpiresAt > DateTimeOffset.UtcNow.AddMinutes(5))
+        {
+            return Unprotect(connection.EncryptedAccessToken);
+        }
+
         var refreshToken = Unprotect(connection.EncryptedRefreshToken);
         var clientId = configuration["Xero:ClientId"] ?? throw new InvalidOperationException("Xero:ClientId is not configured.");
         var tokenUrl = configuration["Xero:TokenUrl"] ?? "https://identity.xero.com/connect/token";
@@ -2776,20 +3258,49 @@ public sealed class XeroIntegrationService(
         {
             connection.ConnectionStatus = "NeedsReconnect";
             connection.LastError = $"Token refresh failed: {response.StatusCode}";
+            await MirrorTokenStateToGlobalTenantAsync(db, connection, cancellationToken);
             await db.SaveChangesAsync(cancellationToken);
             throw new InvalidOperationException("Xero refresh token failed; reconnect the tenant.");
         }
 
         var token = JsonSerializer.Deserialize<XeroTokenResponse>(responseContent, JsonOptions)
             ?? throw new InvalidOperationException("Xero refresh response could not be parsed.");
-        connection.EncryptedAccessToken = Protect(token.AccessToken);
-        connection.EncryptedRefreshToken = Protect(token.RefreshToken);
+        var encryptedAccessToken = Protect(token.AccessToken);
+        var encryptedRefreshToken = Protect(token.RefreshToken);
+        connection.EncryptedAccessToken = encryptedAccessToken;
+        connection.EncryptedRefreshToken = encryptedRefreshToken;
         connection.TokenExpiresAt = DateTimeOffset.UtcNow.AddSeconds(token.ExpiresIn);
         connection.ConnectionStatus = "Connected";
         connection.LastError = null;
         connection.UpdatedAt = DateTimeOffset.UtcNow;
+        await MirrorTokenStateToGlobalTenantAsync(db, connection, cancellationToken);
         await db.SaveChangesAsync(cancellationToken);
         return token.AccessToken;
+    }
+
+    private static async Task MirrorTokenStateToGlobalTenantAsync(AppDbContext db, XeroConnection connection, CancellationToken cancellationToken)
+    {
+        var tenant = await db.XeroTenantConnections.FirstOrDefaultAsync(x => x.TenantId == connection.TenantId, cancellationToken);
+        if (tenant is not null)
+        {
+            tenant.EncryptedAccessToken = connection.EncryptedAccessToken;
+            tenant.EncryptedRefreshToken = connection.EncryptedRefreshToken;
+            tenant.TokenExpiresAt = connection.TokenExpiresAt;
+            tenant.ConnectionStatus = connection.ConnectionStatus;
+            tenant.LastError = connection.LastError;
+            tenant.UpdatedAt = DateTimeOffset.UtcNow;
+        }
+
+        var legacyConnection = await db.XeroConnections.FirstOrDefaultAsync(x => x.TenantId == connection.TenantId, cancellationToken);
+        if (legacyConnection is not null && legacyConnection.Id != connection.Id)
+        {
+            legacyConnection.EncryptedAccessToken = connection.EncryptedAccessToken;
+            legacyConnection.EncryptedRefreshToken = connection.EncryptedRefreshToken;
+            legacyConnection.TokenExpiresAt = connection.TokenExpiresAt;
+            legacyConnection.ConnectionStatus = connection.ConnectionStatus;
+            legacyConnection.LastError = connection.LastError;
+            legacyConnection.UpdatedAt = DateTimeOffset.UtcNow;
+        }
     }
 
     private static List<XeroImportedAccount> BuildTestFixtureAccounts(Guid organizationId, Guid reportingPeriodId, string tenantId)
@@ -2828,9 +3339,15 @@ public sealed class XeroIntegrationService(
         {
             return _protector.Unprotect(value);
         }
-        catch (CryptographicException)
+        catch (CryptographicException ex)
         {
-            return value.StartsWith("ey", StringComparison.Ordinal) ? value : "";
+            // SECURITY: previous behavior silently returned the raw ciphertext when it
+            // looked like a JWT (started with "ey"). That bypassed the entire DataProtection
+            // layer — a mis-keyed token was forwarded to Xero as if it were valid. Cat 1.
+            // Now: surface the failure as a typed exception so the caller can mark the
+            // connection NeedsReconnect and stop using a credential that cannot be trusted.
+            throw new InvalidOperationException(
+                "Xero token decryption failed; reconnect the tenant.", ex);
         }
     }
 

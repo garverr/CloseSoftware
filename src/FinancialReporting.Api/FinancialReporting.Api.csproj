@@ -13,6 +13,29 @@
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.7" />
+    <!-- Real auth: JWT bearer scheme for production; dev still has the IsDevelopment-gated header bypass. -->
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.7" />
+    <!-- OIDC scaffolding so deployments can plug Auth0 / Entra ID / Okta in via config. -->
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.OpenIdConnect" Version="10.0.7" />
+    <!-- P1.13 — board-grade PDF rendering (replaces the hand-rolled 46-line ASCII stub). MIT license. -->
+    <PackageReference Include="QuestPDF" Version="2024.10.3" />
+    <!-- P1.14 — board-grade XLSX rendering (replaces hand-rolled OOXML stub with all-string cells). MIT license. -->
+    <PackageReference Include="ClosedXML" Version="0.104.2" />
+    <!-- P3.29 — Postgres provider deferred: Npgsql.EntityFrameworkCore.PostgreSQL has no
+         GA release for EF Core 10.x yet (preview.7 pins a specific EF Core preview that
+         conflicts with EF Core 10.0.7 GA). Swap in once an EF Core 10 GA Npgsql ships;
+         the DI switch in Program.cs is already provider-agnostic. -->
+    <!-- P3.34 — Serilog structured JSON logging. -->
+    <PackageReference Include="Serilog.AspNetCore" Version="9.0.0" />
+    <PackageReference Include="Serilog.Sinks.Console" Version="6.0.0" />
+    <PackageReference Include="Serilog.Formatting.Compact" Version="3.0.0" />
+    <PackageReference Include="Serilog.Enrichers.Environment" Version="3.0.1" />
+    <!-- P3.34 — OpenTelemetry SDK with OTLP exporter (configurable via env vars). -->
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.15.1" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.12.0" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.Http" Version="1.15.1" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.EntityFrameworkCore" Version="1.12.0-beta.1" />
+    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.15.1" />
   </ItemGroup>
 
 </Project>

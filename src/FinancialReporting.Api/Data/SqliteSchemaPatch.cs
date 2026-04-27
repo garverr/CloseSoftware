@@ -484,6 +484,90 @@ public static class SqliteSchemaPatch
         await AddColumnIfMissingAsync(db, "ReportPackages", "IsSourceDataStale", "INTEGER NOT NULL DEFAULT 0", cancellationToken);
         await AddColumnIfMissingAsync(db, "ReportPackages", "SourceDataStaleReason", "TEXT NULL", cancellationToken);
         await AddColumnIfMissingAsync(db, "ReportPackages", "SourceDataChangedAt", "TEXT NULL", cancellationToken);
+        // P1.1 — Baseline diff engine. Cat 19, 20.
+        await AddColumnIfMissingAsync(db, "ReportPackages", "PriorPackageId", "TEXT NULL", cancellationToken);
+        await AddColumnIfMissingAsync(db, "ReportPackages", "BoardDollarThreshold", "TEXT NOT NULL DEFAULT '25000.00'", cancellationToken);
+        await AddColumnIfMissingAsync(db, "ReportPackages", "BoardPercentThreshold", "TEXT NOT NULL DEFAULT '15.00'", cancellationToken);
+        // P2.20 — Materiality matrix. Cat 10.
+        await db.Database.ExecuteSqlRawAsync("""
+            CREATE TABLE IF NOT EXISTS "OrgFluxThresholdConfigs" (
+                "Id" TEXT NOT NULL CONSTRAINT "PK_OrgFluxThresholdConfigs" PRIMARY KEY,
+                "OrganizationId" TEXT NOT NULL,
+                "StatementType" TEXT NOT NULL,
+                "AccountClass" TEXT NOT NULL,
+                "DollarThreshold" TEXT NOT NULL DEFAULT '5000.00',
+                "PercentThreshold" TEXT NOT NULL DEFAULT '10.00',
+                "ThresholdLogic" TEXT NOT NULL DEFAULT 'AND',
+                "CreatedAt" TEXT NOT NULL,
+                "UpdatedAt" TEXT NOT NULL
+            );
+            """, cancellationToken);
+        await db.Database.ExecuteSqlRawAsync("""CREATE UNIQUE INDEX IF NOT EXISTS "IX_OrgFluxThresholdConfigs_OrganizationId_StatementType_AccountClass" ON "OrgFluxThresholdConfigs" ("OrganizationId", "StatementType", "AccountClass");""", cancellationToken);
+
+        // Vendor cache for ContactName resolution. Cat 14.
+        await db.Database.ExecuteSqlRawAsync("""
+            CREATE TABLE IF NOT EXISTS "XeroContacts" (
+                "Id" TEXT NOT NULL CONSTRAINT "PK_XeroContacts" PRIMARY KEY,
+                "TenantId" TEXT NOT NULL,
+                "ContactId" TEXT NOT NULL,
+                "Name" TEXT NOT NULL,
+                "IsCustomer" INTEGER NOT NULL DEFAULT 0,
+                "IsSupplier" INTEGER NOT NULL DEFAULT 0,
+                "Status" TEXT NOT NULL DEFAULT '',
+                "SyncedAt" TEXT NOT NULL
+            );
+            """, cancellationToken);
+        await db.Database.ExecuteSqlRawAsync("""CREATE UNIQUE INDEX IF NOT EXISTS "IX_XeroContacts_TenantId_ContactId" ON "XeroContacts" ("TenantId", "ContactId");""", cancellationToken);
+
+        // P0.6 — Authoritative Chart of Accounts cache. Cat 3.
+        await db.Database.ExecuteSqlRawAsync("""
+            CREATE TABLE IF NOT EXISTS "XeroChartOfAccounts" (
+                "Id" TEXT NOT NULL CONSTRAINT "PK_XeroChartOfAccounts" PRIMARY KEY,
+                "TenantId" TEXT NOT NULL,
+                "Code" TEXT NOT NULL,
+                "Name" TEXT NOT NULL,
+                "Type" TEXT NOT NULL,
+                "Class" TEXT NOT NULL,
+                "Status" TEXT NOT NULL,
+                "ReportingCode" TEXT NOT NULL DEFAULT '',
+                "ParentCode" TEXT NOT NULL DEFAULT '',
+                "IsArchived" INTEGER NOT NULL DEFAULT 0,
+                "SyncedAt" TEXT NOT NULL
+            );
+            """, cancellationToken);
+        await db.Database.ExecuteSqlRawAsync("""CREATE UNIQUE INDEX IF NOT EXISTS "IX_XeroChartOfAccounts_TenantId_Code" ON "XeroChartOfAccounts" ("TenantId", "Code");""", cancellationToken);
+
+        // P0.5 — journal-line metadata. Cat 3, 4, 14, 17.
+        await AddColumnIfMissingAsync(db, "XeroJournals", "SourceId", "TEXT NOT NULL DEFAULT ''", cancellationToken);
+        await AddColumnIfMissingAsync(db, "XeroJournals", "ContactId", "TEXT NOT NULL DEFAULT ''", cancellationToken);
+        await AddColumnIfMissingAsync(db, "XeroJournals", "ContactName", "TEXT NOT NULL DEFAULT ''", cancellationToken);
+        await AddColumnIfMissingAsync(db, "XeroJournals", "IsVoided", "INTEGER NOT NULL DEFAULT 0", cancellationToken);
+        await AddColumnIfMissingAsync(db, "XeroJournals", "CurrencyCode", "TEXT NOT NULL DEFAULT ''", cancellationToken);
+        await AddColumnIfMissingAsync(db, "XeroJournals", "CurrencyRate", "TEXT NOT NULL DEFAULT '0.00'", cancellationToken);
+
+        // P1.16 — CFO approval gate. Cat 26.
+        await AddColumnIfMissingAsync(db, "ReportPackages", "IsApproved", "INTEGER NOT NULL DEFAULT 0", cancellationToken);
+        await AddColumnIfMissingAsync(db, "ReportPackages", "ApprovedBy", "TEXT NOT NULL DEFAULT ''", cancellationToken);
+        await AddColumnIfMissingAsync(db, "ReportPackages", "ApprovedAt", "TEXT NULL", cancellationToken);
+        await AddColumnIfMissingAsync(db, "ReportPackages", "ApprovedVersionId", "TEXT NULL", cancellationToken);
+
+        // P1.17 — AI provenance on SlideBlock. Cat 25.
+        await AddColumnIfMissingAsync(db, "SlideBlocks", "IsAiAuthored", "INTEGER NOT NULL DEFAULT 0", cancellationToken);
+        await AddColumnIfMissingAsync(db, "SlideBlocks", "OriginatingAiRunId", "TEXT NULL", cancellationToken);
+        await AddColumnIfMissingAsync(db, "SlideBlocks", "AiAuthoredAt", "TEXT NULL", cancellationToken);
+
+        // P2.26 — AuditRecord linkage to AiRun + correlation, AiRun token counts + InputHash.
+        await AddColumnIfMissingAsync(db, "AuditRecords", "AiRunId", "TEXT NULL", cancellationToken);
+        await AddColumnIfMissingAsync(db, "AuditRecords", "CorrelationId", "TEXT NULL", cancellationToken);
+        await AddColumnIfMissingAsync(db, "AiRuns", "PromptTokens", "INTEGER NOT NULL DEFAULT 0", cancellationToken);
+        await AddColumnIfMissingAsync(db, "AiRuns", "CompletionTokens", "INTEGER NOT NULL DEFAULT 0", cancellationToken);
+        await AddColumnIfMissingAsync(db, "AiRuns", "InputHash", "TEXT NOT NULL DEFAULT ''", cancellationToken);
+
+        // P3.31 — composite indexes for hot paths. Cat 32.
+        await db.Database.ExecuteSqlRawAsync("""CREATE INDEX IF NOT EXISTS "IX_GlTransactions_GlAccountId_TransactionDate" ON "GlTransactions" ("GlAccountId", "TransactionDate");""", cancellationToken);
+        await db.Database.ExecuteSqlRawAsync("""CREATE INDEX IF NOT EXISTS "IX_XeroJournals_TenantId_JournalDate" ON "XeroJournals" ("TenantId", "JournalDate");""", cancellationToken);
+        await db.Database.ExecuteSqlRawAsync("""CREATE INDEX IF NOT EXISTS "IX_AiRuns_Status" ON "AiRuns" ("Status");""", cancellationToken);
+        await db.Database.ExecuteSqlRawAsync("""CREATE INDEX IF NOT EXISTS "IX_AuditRecords_AiRunId" ON "AuditRecords" ("AiRunId");""", cancellationToken);
         await AddColumnIfMissingAsync(db, "XeroConnections", "CreatedAt", "TEXT NOT NULL DEFAULT '0001-01-01T00:00:00+00:00'", cancellationToken);
         await AddColumnIfMissingAsync(db, "XeroConnections", "UpdatedAt", "TEXT NOT NULL DEFAULT '0001-01-01T00:00:00+00:00'", cancellationToken);
         await AddColumnIfMissingAsync(db, "XeroSyncRuns", "Error", "TEXT NULL", cancellationToken);

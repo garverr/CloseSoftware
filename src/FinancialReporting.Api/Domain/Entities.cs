@@ -86,6 +86,22 @@ public sealed class ReportPackage
     public PackageStatus Status { get; set; } = PackageStatus.Draft;
     public string VersionLabel { get; set; } = "v1";
     public string BaseFrom { get; set; } = "";
+    // FK to the prior month's package this one was built from. Drives the AI baseline diff
+    // engine: slides from the prior package are evaluated for keep/modify/add/remove against
+    // the current month's flux. Cat 19. Nullable because a brand-new org has no prior.
+    public Guid? PriorPackageId { get; set; }
+    // Tiered materiality: ops-level thresholds live on FluxReviewGroup; these are the
+    // CFO/Board cutoffs that decide whether a slide reaches the board package versus an
+    // appendix. Cat 20. Defaults are conservative starting points; tunable per package.
+    public decimal BoardDollarThreshold { get; set; } = 25000m;
+    public decimal BoardPercentThreshold { get; set; } = 15m;
+    // P1.16 — CFO approval gate. Once approved the package is immutable (UpdatedAt and
+    // mutating endpoints reject); DistributionSchedule send is blocked unless IsApproved.
+    // Cat 26.
+    public bool IsApproved { get; set; }
+    public string ApprovedBy { get; set; } = "";
+    public DateTimeOffset? ApprovedAt { get; set; }
+    public Guid? ApprovedVersionId { get; set; }   // PackageVersion snapshot tagged at approval
     public DateTimeOffset? LastXeroSyncAt { get; set; }
     public bool IsSourceDataStale { get; set; }
     public string? SourceDataStaleReason { get; set; }
@@ -126,6 +142,12 @@ public sealed class SlideBlock
     public int SortOrder { get; set; }
     public string Kind { get; set; } = "text";
     public string ContentJson { get; set; } = "{}";
+    // P1.17 — AI provenance on accepted suggestions. Without these fields a CFO cannot
+    // distinguish AI-authored prose from human-authored prose after the fact, breaking
+    // both auditability and the "review what AI wrote" workflow. Cat 25.
+    public bool IsAiAuthored { get; set; }
+    public Guid? OriginatingAiRunId { get; set; }
+    public DateTimeOffset? AiAuthoredAt { get; set; }
 }
 
 public sealed class KpiDefinition
@@ -378,6 +400,14 @@ public sealed class XeroJournal
     public DateTimeOffset? CreatedDateUtc { get; set; }
     public string SourceType { get; set; } = "";
     public string Reference { get; set; } = "";
+    // Metadata captured from the Xero /Journals payload to enable vendor-pattern detection,
+    // void-aware reconciliation, and machine-parseable AI citations. Cat 3, 4, 14, 17.
+    public string SourceId { get; set; } = "";       // Xero SourceID (originating doc GUID)
+    public string ContactId { get; set; } = "";     // Counterparty / payee GUID when present
+    public string ContactName { get; set; } = "";   // Counterparty / payee display name
+    public bool IsVoided { get; set; }              // True when payload Status flags void/deleted
+    public string CurrencyCode { get; set; } = "";  // Org base currency or per-source currency
+    public decimal CurrencyRate { get; set; }       // FX rate to base; 0 = unknown / base currency
     public string PayloadJson { get; set; } = "{}";
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
@@ -546,6 +576,61 @@ public sealed class XeroOAuthSession
     public DateTimeOffset? CodeConsumedAt { get; set; }
 }
 
+/// <summary>
+/// P2.20 — Materiality matrix. Per (OrganizationId, StatementType, AccountClass) tunable
+/// thresholds; new FluxReviewGroup rows are seeded from the matching row instead of the
+/// hardcoded 0 / 10% defaults that effectively disabled the dollar leg of the dual-threshold
+/// gate. Cat 10.
+/// </summary>
+public sealed class OrgFluxThresholdConfig
+{
+    public Guid Id { get; set; }
+    public Guid OrganizationId { get; set; }
+    public string StatementType { get; set; } = "";    // ProfitAndLoss / BalanceSheet / "*"
+    public string AccountClass { get; set; } = "";     // Revenue / Operating Expense / Asset / "*"
+    public decimal DollarThreshold { get; set; } = 5000m;
+    public decimal PercentThreshold { get; set; } = 10m;
+    public string ThresholdLogic { get; set; } = "AND"; // AND = both must trip; OR = either
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+/// <summary>
+/// Cache of Xero contacts (vendors / customers). Lets the flux pipeline resolve
+/// ContactName for journals where the ContactID was captured but the inline Contact node
+/// wasn't present (ACCREC/ACCPAY journals derived from Invoices/Bills). Cat 14.
+/// </summary>
+public sealed class XeroContact
+{
+    public Guid Id { get; set; }
+    public string TenantId { get; set; } = "";
+    public string ContactId { get; set; } = "";
+    public string Name { get; set; } = "";
+    public bool IsCustomer { get; set; }
+    public bool IsSupplier { get; set; }
+    public string Status { get; set; } = "";       // ACTIVE / ARCHIVED
+    public DateTimeOffset SyncedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+/// <summary>
+/// Authoritative chart-of-accounts cache fetched from Xero /Accounts. Replaces the prior
+/// GuessTypeFromAmount sign heuristic in ProjectGlForPeriodAsync. Cat 3.
+/// </summary>
+public sealed class XeroChartOfAccount
+{
+    public Guid Id { get; set; }
+    public string TenantId { get; set; } = "";
+    public string Code { get; set; } = "";
+    public string Name { get; set; } = "";
+    public string Type { get; set; } = "";          // Xero AccountType (e.g. REVENUE, EXPENSE)
+    public string Class { get; set; } = "";         // Xero AccountClass (e.g. ASSET, LIABILITY)
+    public string Status { get; set; } = "";        // ACTIVE / ARCHIVED
+    public string ReportingCode { get; set; } = ""; // Reporting hierarchy code
+    public string ParentCode { get; set; } = "";    // For sub-accounts
+    public bool IsArchived { get; set; }
+    public DateTimeOffset SyncedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
 public sealed class GlAccount
 {
     public Guid Id { get; set; }
@@ -712,6 +797,11 @@ public sealed class AiRun
     public string OutputJson { get; set; } = "{}";
     public string Logs { get; set; } = "";
     public bool CancellationRequested { get; set; }
+    // P2.26 — token accounting + cost reproduction. Cat 18.
+    public int PromptTokens { get; set; }
+    public int CompletionTokens { get; set; }
+    // Hash of InputJson at run time so a re-execution can prove identical inputs.
+    public string InputHash { get; set; } = "";
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset? StartedAt { get; set; }
     public DateTimeOffset? CompletedAt { get; set; }
@@ -787,5 +877,9 @@ public sealed class AuditRecord
     public string Reason { get; set; } = "";
     public string BeforeJson { get; set; } = "{}";
     public string AfterJson { get; set; } = "{}";
+    // P2.26 — link audit rows to the AI run that produced the change so a CFO/auditor can
+    // traverse audit → AI run → input prompt → output → journal-line citations. Cat 18.
+    public Guid? AiRunId { get; set; }
+    public string? CorrelationId { get; set; }
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
 }
