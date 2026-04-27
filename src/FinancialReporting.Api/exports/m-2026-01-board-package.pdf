@@ -1,0 +1,59 @@
+%PDF-1.4
+1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj
+4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj
+5 0 obj << /Length 2330 >> stream
+BT /F1 10 Tf 54 760 Td 14 TL
+(MaxCareRX Board Package) Tj T*
+(Period: January 2026) Tj T*
+(Version: January 2026 draft) Tj T*
+() Tj T*
+(1. Total Cost of Sales - Less Cost of Sales) Tj T*
+(Current $2,575,209 | Prior $2,032,944 | Variance $542,265 \(26.7%\)) Tj T*
+(Total Cost of Sales was $2,575,209 for January 2026 versus $2,032,944 in January 2025.) Tj T*
+(Generated from Xero accrual-basis reports. Review mapping and first-seen accounts before final distribution.) Tj T*
+() Tj T*
+(2. COGS-Claims - Less Cost of Sales) Tj T*
+(Current $2,117,057 | Prior $1,505,758 | Variance $611,299 \(40.6%\)) Tj T*
+(COGS-Claims was $2,117,057 for January 2026 versus $1,505,758 in January 2025.) Tj T*
+(Generated from Xero accrual-basis reports. Review mapping and first-seen accounts before final distribution.) Tj T*
+() Tj T*
+(3. Total Revenue - Revenue) Tj T*
+(Current $1,753,844 | Prior $2,139,094 | Variance -$385,250 \(-18.0%\)) Tj T*
+(Total Revenue was $1,753,844 for January 2026 versus $2,139,094 in January 2025.) Tj T*
+(Generated from Xero accrual-basis reports. Review mapping and first-seen accounts before final distribution.) Tj T*
+() Tj T*
+(4. Claims - MaxCare - Revenue) Tj T*
+(Current $1,203,779 | Prior $1,505,758 | Variance -$301,979 \(-20.1%\)) Tj T*
+(Claims - MaxCare was $1,203,779 for January 2026 versus $1,505,758 in January 2025.) Tj T*
+(Generated from Xero accrual-basis reports. Review mapping and first-seen accounts before final distribution.) Tj T*
+() Tj T*
+(5. Net Income  / \(Loss\) before Tax - ProfitAndLoss) Tj T*
+(Current -$1,056,019 | Prior -$156,291 | Variance -$899,728 \(575.7%\)) Tj T*
+(Net Income  / \(Loss\) before Tax was -$1,056,019 for January 2026 versus -$156,291 in January 2025.) Tj T*
+(Generated from Xero accrual-basis reports. Review mapping and first-seen accounts before final distribution.) Tj T*
+() Tj T*
+(6. Net Income - ProfitAndLoss) Tj T*
+(Current -$1,056,019 | Prior -$156,291 | Variance -$899,728 \(575.7%\)) Tj T*
+(Net Income was -$1,056,019 for January 2026 versus -$156,291 in January 2025.) Tj T*
+(Generated from Xero accrual-basis reports. Review mapping and first-seen accounts before final distribution.) Tj T*
+() Tj T*
+(QA Issues) Tj T*
+() Tj T*
+(Appendix) Tj T*
+(Source: persisted package, GL mappings, elimination overlays, KPI data, and AI review records.) Tj T*
+ET
+endstream endobj
+xref
+0 6
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000241 00000 n 
+0000000311 00000 n 
+trailer << /Size 6 /Root 1 0 R >>
+startxref
+2693
+%%EOF

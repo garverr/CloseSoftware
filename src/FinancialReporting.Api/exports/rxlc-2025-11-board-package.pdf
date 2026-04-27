@@ -1,0 +1,55 @@
+%PDF-1.4
+1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj
+4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj
+5 0 obj << /Length 2451 >> stream
+BT /F1 10 Tf 54 760 Td 14 TL
+(RxLinc, LLC Board Package) Tj T*
+(Period: November 2025) Tj T*
+(Version: v3 \(in progress\)) Tj T*
+() Tj T*
+(1. PTPL - RXL PTPL) Tj T*
+(Current $7,592,706 | Prior $7,105,342 | Variance $487,364 \(6.9%\)) Tj T*
+(RxLinc PTPL is up year-over-year; however, the majority of the increase occurred in Q1 2025.) Tj T*
+(RxLinc has seen significant growth in customer counts due to the work of the sales department, which has offset vendor-partner headwinds.) Tj T*
+() Tj T*
+(2. ePrescribe - EPRESCRIBE) Tj T*
+(Current $2,092,239 | Prior $2,414,449 | Variance -$322,210 \(-13.3%\)) Tj T*
+(RxLinc ePrescribe revenue has decreased significantly following the loss of a vendor partner in late 2024.) Tj T*
+(YTD ePrescribe revenue of $2,092,239 is down $322,210 or 13.4% versus prior year.) Tj T*
+(Prior year included a one-time SureScripts discount benefit in April 2024.) Tj T*
+() Tj T*
+(3. Switch / Transmission - SWITCH / TRANSMISSION) Tj T*
+(Current $7,199,786 | Prior $6,693,400 | Variance $506,386 \(7.6%\)) Tj T*
+(Switch revenue is up year-over-year, and gross profit is up significantly as well.) Tj T*
+(Starting in May 2025, revenue increased past the previous highs achieved under short-term contracts.) Tj T*
+() Tj T*
+(4. Salaries and Wages - SALARIES AND WAGES) Tj T*
+(Current $1,683,478 | Prior $1,360,666 | Variance $322,812 \(23.7%\)) Tj T*
+(Salaries and wages are up year-over-year for RxLinc.) Tj T*
+(In November 2025, the longevity bonus experienced a decrease due to a true-up of the beginning-of-year estimate.) Tj T*
+() Tj T*
+(QA Issues) Tj T*
+(Medium | Resolved | First-seen account needs review: The new ePrescribe gross profit account is mapped with high confidence but has not been marked reviewed.) Tj T*
+(Medium | Open | First-seen account needs review: The new ePrescribe gross profit account is mapped with high confidence but has not been marked reviewed.) Tj T*
+(Medium | Open | First-seen account needs review: The new ePrescribe gross profit account is mapped with high confidence but has not been marked reviewed.) Tj T*
+(High | Open | PY November anomaly not addressed: PY November showed $195K versus the typical $110K-$130K range.) Tj T*
+(Medium | Resolved | PY April spike not annotated: April 2024 SureScripts discount distorts PY gross profit comparison.) Tj T*
+() Tj T*
+(Appendix) Tj T*
+(Source: persisted package, GL mappings, elimination overlays, KPI data, and AI review records.) Tj T*
+ET
+endstream endobj
+xref
+0 6
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000241 00000 n 
+0000000311 00000 n 
+trailer << /Size 6 /Root 1 0 R >>
+startxref
+2814
+%%EOF

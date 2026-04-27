@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/FinancialReporting.Api/FinancialReporting.Api.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/FinancialReporting.Api.Tests/FinancialReporting.Api.Tests.csproj" />
+  </Folder>
+</Solution>

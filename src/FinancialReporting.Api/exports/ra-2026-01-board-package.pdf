@@ -1,0 +1,59 @@
+%PDF-1.4
+1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj
+4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj
+5 0 obj << /Length 2344 >> stream
+BT /F1 10 Tf 54 760 Td 14 TL
+(RxLinc - Active Board Package) Tj T*
+(Period: January 2026) Tj T*
+(Version: January 2026 draft) Tj T*
+() Tj T*
+(1. Total Revenue - Revenue) Tj T*
+(Current $19,680,150 | Prior $11,461,346 | Variance $8,218,803 \(71.7%\)) Tj T*
+(Total Revenue was $19,680,150 for January 2026 versus $11,461,346 in January 2025.) Tj T*
+(Generated from Xero accrual-basis reports. Review mapping and first-seen accounts before final distribution.) Tj T*
+() Tj T*
+(2. Total Cost of Sales - Less Cost of Sales) Tj T*
+(Current $18,673,005 | Prior $10,606,951 | Variance $8,066,053 \(76.0%\)) Tj T*
+(Total Cost of Sales was $18,673,005 for January 2026 versus $10,606,951 in January 2025.) Tj T*
+(Generated from Xero accrual-basis reports. Review mapping and first-seen accounts before final distribution.) Tj T*
+() Tj T*
+(3. eVoucher receipts - Revenue) Tj T*
+(Current $18,173,963 | Prior $10,104,884 | Variance $8,069,079 \(79.9%\)) Tj T*
+(eVoucher receipts was $18,173,963 for January 2026 versus $10,104,884 in January 2025.) Tj T*
+(Generated from Xero accrual-basis reports. Review mapping and first-seen accounts before final distribution.) Tj T*
+() Tj T*
+(4. COGS-eVouchers - Less Cost of Sales) Tj T*
+(Current $18,173,963 | Prior $10,104,884 | Variance $8,069,079 \(79.9%\)) Tj T*
+(COGS-eVouchers was $18,173,963 for January 2026 versus $10,104,884 in January 2025.) Tj T*
+(Generated from Xero accrual-basis reports. Review mapping and first-seen accounts before final distribution.) Tj T*
+() Tj T*
+(5. Gross Profit - ProfitAndLoss) Tj T*
+(Current $1,007,145 | Prior $854,395 | Variance $152,750 \(17.9%\)) Tj T*
+(Gross Profit was $1,007,145 for January 2026 versus $854,395 in January 2025.) Tj T*
+(Generated from Xero accrual-basis reports. Review mapping and first-seen accounts before final distribution.) Tj T*
+() Tj T*
+(6. Operating Income / \(Loss\) - ProfitAndLoss) Tj T*
+(Current $1,007,145 | Prior $854,395 | Variance $152,750 \(17.9%\)) Tj T*
+(Operating Income / \(Loss\) was $1,007,145 for January 2026 versus $854,395 in January 2025.) Tj T*
+(Generated from Xero accrual-basis reports. Review mapping and first-seen accounts before final distribution.) Tj T*
+() Tj T*
+(QA Issues) Tj T*
+() Tj T*
+(Appendix) Tj T*
+(Source: persisted package, GL mappings, elimination overlays, KPI data, and AI review records.) Tj T*
+ET
+endstream endobj
+xref
+0 6
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000241 00000 n 
+0000000311 00000 n 
+trailer << /Size 6 /Root 1 0 R >>
+startxref
+2707
+%%EOF
